@@ -284,4 +284,25 @@ impl PlatformAtlas for HeadlessAtlas {
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().tiles.remove(key);
     }
+
+    fn update(
+        &self,
+        key: &AtlasKey,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+        bytes_per_row: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.0.lock().tiles.contains_key(key),
+            "atlas tile was not found"
+        );
+        anyhow::ensure!(
+            bounds.size.width.0 > 0
+                && bounds.size.height.0 > 0
+                && bytes_per_row >= bounds.size.width.0 as u32 * 4
+                && !bytes.is_empty(),
+            "invalid dynamic texture update"
+        );
+        Ok(())
+    }
 }

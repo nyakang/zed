@@ -123,6 +123,32 @@ impl PlatformAtlas for DirectXAtlas {
             }
         }
     }
+
+    fn update(
+        &self,
+        key: &AtlasKey,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+        bytes_per_row: u32,
+    ) -> anyhow::Result<()> {
+        let lock = self.0.lock();
+        let tile = *lock
+            .tiles_by_key
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("atlas tile was not found"))?;
+        validate_update(tile, bounds, bytes, bytes_per_row)?;
+        let absolute = Bounds {
+            origin: tile.bounds.origin + bounds.origin,
+            size: bounds.size,
+        };
+        lock.texture(tile.texture_id).upload_with_stride(
+            &lock.device_context,
+            absolute,
+            bytes,
+            bytes_per_row,
+        );
+        Ok(())
+    }
 }
 
 impl DirectXAtlasState {
@@ -319,6 +345,32 @@ impl DirectXAtlasTexture {
         }
     }
 
+    fn upload_with_stride(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+        bytes_per_row: u32,
+    ) {
+        unsafe {
+            device_context.UpdateSubresource(
+                &self.texture,
+                0,
+                Some(&D3D11_BOX {
+                    left: bounds.left().0 as u32,
+                    top: bounds.top().0 as u32,
+                    front: 0,
+                    right: bounds.right().0 as u32,
+                    bottom: bounds.bottom().0 as u32,
+                    back: 1,
+                }),
+                bytes.as_ptr() as _,
+                bytes_per_row,
+                0,
+            );
+        }
+    }
+
     fn decrement_ref_count(&mut self) {
         self.live_atlas_keys -= 1;
     }
@@ -326,6 +378,49 @@ impl DirectXAtlasTexture {
     fn is_unreferenced(&mut self) -> bool {
         self.live_atlas_keys == 0
     }
+}
+
+fn validate_update(
+    tile: AtlasTile,
+    bounds: Bounds<DevicePixels>,
+    bytes: &[u8],
+    bytes_per_row: u32,
+) -> anyhow::Result<()> {
+    let width = u32::try_from(bounds.size.width.0)
+        .map_err(|_| anyhow::anyhow!("negative texture width"))?;
+    let height = u32::try_from(bounds.size.height.0)
+        .map_err(|_| anyhow::anyhow!("negative texture height"))?;
+    let right = bounds
+        .origin
+        .x
+        .0
+        .checked_add(bounds.size.width.0)
+        .ok_or_else(|| anyhow::anyhow!("texture bounds overflow"))?;
+    let bottom = bounds
+        .origin
+        .y
+        .0
+        .checked_add(bounds.size.height.0)
+        .ok_or_else(|| anyhow::anyhow!("texture bounds overflow"))?;
+    if bounds.origin.x.0 < 0
+        || bounds.origin.y.0 < 0
+        || right > tile.bounds.size.width.0
+        || bottom > tile.bounds.size.height.0
+        || width == 0
+        || height == 0
+        || bytes_per_row < width * 4
+    {
+        anyhow::bail!("dynamic texture update is outside the allocated tile");
+    }
+    let required = usize::try_from(height - 1)?
+        .checked_mul(bytes_per_row as usize)
+        .and_then(|offset| offset.checked_add(width as usize * 4))
+        .ok_or_else(|| anyhow::anyhow!("dynamic texture payload size overflow"))?;
+    anyhow::ensure!(
+        bytes.len() == required,
+        "dynamic texture payload length mismatch"
+    );
+    Ok(())
 }
 
 fn device_size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
