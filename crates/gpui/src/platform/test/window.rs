@@ -600,3 +600,54 @@ impl PlatformAtlas for TestAtlas {
         self.0.lock().tiles.contains_key(key)
     }
 }
+
+#[cfg(test)]
+mod dynamic_texture_tests {
+    use std::borrow::Cow;
+
+    use super::TestAtlas;
+    use crate::{AtlasKey, Bounds, DevicePixels, DynamicTextureId, PlatformAtlas, point, size};
+
+    #[test]
+    fn strided_update_preserves_pixels_outside_the_dirty_rectangle() {
+        let atlas = TestAtlas::new();
+        let key = AtlasKey::DynamicTexture(DynamicTextureId(7));
+        let texture_size = size(DevicePixels(4), DevicePixels(4));
+        atlas
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((texture_size, Cow::Owned(vec![0x11; 4 * 4 * 4]))))
+            })
+            .unwrap();
+
+        let stride = 16u32;
+        let mut source = vec![0xAA; stride as usize + 8];
+        source[16..24].fill(0xCC);
+        atlas
+            .update(
+                &key,
+                Bounds::new(
+                    point(DevicePixels(1), DevicePixels(1)),
+                    size(DevicePixels(2), DevicePixels(2)),
+                ),
+                &source,
+                stride,
+            )
+            .unwrap();
+
+        let state = atlas.0.lock();
+        let pixels = &state.pixels[&key];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let pixel = &pixels[(y * 4 + x) * 4..(y * 4 + x + 1) * 4];
+                let expected = if y == 1 && (x == 1 || x == 2) {
+                    0xAA
+                } else if y == 2 && (x == 1 || x == 2) {
+                    0xCC
+                } else {
+                    0x11
+                };
+                assert!(pixel.iter().all(|byte| *byte == expected));
+            }
+        }
+    }
+}
