@@ -490,6 +490,16 @@ impl WindowsWindow {
         let mut owner_guard = if params.kind == WindowKind::Dialog {
             let owner = unsafe { GetActiveWindow() };
             if owner.is_invalid() {
+                // The window is still created: a caller that asked for a dialog
+                // wants its content on screen either way. Say so, though, because
+                // neither consequence is visible in the `Ok` this returns. It is
+                // not modal, and it also gains a taskbar button -- the dialog
+                // ex-style is `WS_EX_DLGMODALFRAME` and deliberately omits
+                // `WS_EX_APPWINDOW`, but the shell only suppresses the button for
+                // an *owned* window, and this one has no owner.
+                log::warn!(
+                    "WindowKind::Dialog requested with no active window to own it; opening it non-modal"
+                );
                 DisabledOwnerGuard(None)
             } else {
                 DisabledOwnerGuard::disable(owner)
