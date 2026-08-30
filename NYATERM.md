@@ -8,8 +8,8 @@ to GPUI on top of an unmodified upstream base.
 - Base revision: `4278ff36ef` (upstream `main`)
 - Branch: `nyaterm`
 - Crates touched: `gpui`, `gpui_apple`, `gpui_wgpu`, `gpui_windows`,
-  `gpui_linux`. Nothing else in the workspace is modified, and no dependency is
-  added, so `Cargo.lock` is unchanged.
+  `gpui_linux`, `gpui_macos`, and `gpui_web`. Nothing else in the workspace is
+  modified, and no dependency is added, so `Cargo.lock` is unchanged.
 
 NyaTerm consumes `gpui` and the platform renderer crates from one coherent
 snapshot, and needs a mutable texture it can update per dirty region for the
@@ -39,6 +39,10 @@ and clones the entire framebuffer for every frame.
 5. `feat(gpui_windows): warn when a Dialog has no window to own it` — an invalid
    `GetActiveWindow` left `Dialog` silently non-modal (and, without an owner,
    holding a taskbar button of its own) while still returning `Ok`.
+6. `feat(gpui): add a hidden cursor style` — adds `CursorStyle::Hidden` as a
+   hitbox-scoped cursor style. Windows uses a null `HCURSOR`, X11 reuses its
+   persistent invisible cursor, Wayland clears the pointer surface, macOS uses
+   a cached transparent `NSCursor`, and Web maps the style to CSS `none`.
 
 ## Not carried here
 
@@ -69,6 +73,14 @@ All pass, warning-free. `gpui_apple` (Metal) and `gpui_linux` cannot be compiled
 on this host, so those two `update` implementations rest on
 `.github/workflows/nyaterm.yml`, which checks `gpui_wgpu`/`gpui_linux` on Linux
 and `gpui_apple` on macOS.
+
+The hidden-cursor patch was additionally checked on Windows 11 with
+`cargo check -p gpui -p gpui_platform -p gpui_windows`. Its focused
+`gpui_windows` unit test is present, but the crate's test configuration currently
+fails before running tests because `gpui_windows::WindowsWindow` exposes the
+test-only `render_to_image` method while the selected `gpui::PlatformWindow`
+trait does not. The normal library check is clean; Linux, macOS, and Web
+exhaustive cursor matches are covered by the branch workflow.
 
 One consumer-visible thing to know about this base rather than about the patches:
 `gpui-component` declares `gpui` with `features = ["profiler"]`, so feature

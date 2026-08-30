@@ -2346,6 +2346,10 @@ impl From<&str> for PromptButton {
 /// The style of the cursor (pointer)
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum CursorStyle {
+    /// Hide the native cursor while the pointer is over the element.
+    /// Corresponds to the CSS cursor value `none`.
+    Hidden,
+
     /// The default cursor
     #[default]
     Arrow,
