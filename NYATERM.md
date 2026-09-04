@@ -5,7 +5,8 @@ to GPUI on top of an unmodified upstream base.
 
 - Fork: <https://github.com/nyakang/zed>
 - Upstream: <https://github.com/zed-industries/zed>
-- Base revision: `4278ff36ef` (upstream `main`)
+- Base revision: `801c087af2` (the Zed snapshot published as
+  `gpui-pre 0.3.1`)
 - Branch: `nyaterm`
 - Crates touched: `gpui`, `gpui_apple`, `gpui_wgpu`, `gpui_windows`,
   `gpui_linux`, `gpui_macos`, and `gpui_web`. Nothing else in the workspace is
@@ -53,13 +54,19 @@ NyaTerm-local about them to keep out of this branch.
 
 ## Validation
 
-The series was rebased from `78712609` onto `4278ff36`, 140 upstream commits
-later, without a single conflict: the only files both sides touch are
-`crates/gpui/src/platform.rs`, `crates/gpui/src/window.rs`,
-`crates/gpui/src/platform/test/window.rs` and `crates/gpui_windows/src/window.rs`,
-and in each one the hunks are hundreds of lines apart. Upstream did not touch
-`PlatformAtlas`, `AtlasKey`, `AtlasTextureKind`, `AtlasTile`, or any of the five
-atlas implementations.
+The series was rebased from `4278ff36` onto `801c087a`, 130 upstream commits
+later, so gpui-component 0.6.0 and NyaTerm compile against the same GPUI API.
+Two conflicts required manual resolution:
+
+- `crates/gpui/src/window.rs` gained upstream touch and text-input state. The
+  resolution keeps those imports and APIs and adds `DynamicTexture` and
+  `DynamicTextureId` alongside them.
+- `crates/gpui_macos/src/window.rs` changed window construction while moving
+  prompts to objc2. The resolution keeps that construction and initializes the
+  cached transparent `NSCursor` before the new shared state is created.
+
+The atlas implementations and Windows dialog-owner changes applied without
+conflicts.
 
 On Windows 11 at the new base:
 
@@ -67,10 +74,13 @@ On Windows 11 at the new base:
 cargo check -p gpui -p gpui_platform   # clean
 cargo test -p gpui strided_update_preserves_pixels_outside_the_dirty_rectangle
 cargo check -p gpui_windows            # clean
+cargo fmt -p gpui -p gpui_platform -p gpui_windows -p gpui_apple \
+  -p gpui_linux -p gpui_web -p gpui_wgpu -- --check
 ```
 
-All pass, warning-free. `gpui_apple` (Metal) and `gpui_linux` cannot be compiled
-on this host, so those two `update` implementations rest on
+All pass. Rust reports only the MSVC linker messages emitted while producing
+proc-macro import libraries. `gpui_apple` (Metal) and `gpui_linux` cannot be
+compiled on this host, so those two `update` implementations rest on
 `.github/workflows/nyaterm.yml`, which checks `gpui_wgpu`/`gpui_linux` on Linux
 and `gpui_apple` on macOS.
 
