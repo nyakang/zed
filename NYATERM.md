@@ -5,7 +5,7 @@ to GPUI on top of an unmodified upstream base.
 
 - Fork: <https://github.com/nyakang/zed>
 - Upstream: <https://github.com/zed-industries/zed>
-- Base revision: `f25434f3c5` (upstream `main` on 2026-09-22)
+- Base revision: `f8c2cc844057540ca1eac7de4f19f50d7597dead` (upstream `main` on 2026-10-01)
 - Branch: `nyaterm`
 - Crates touched: `gpui`, `gpui_apple`, `gpui_wgpu`, `gpui_windows`,
   `gpui_linux`, `gpui_macos`, and `gpui_web`. Nothing else in the workspace is
@@ -124,3 +124,26 @@ cargo fmt --all -- --check
 The focused test starts a typed drag in one GPUI window and dispatches the move
 and release through a second window, asserting that the second window consumes
 the payload and that the application-global drag state is cleared.
+
+## 2026-10-01 upstream merge
+
+Merged upstream main while preserving dynamic textures, hidden cursors, modal
+owner rollback and cross-window internal drag routing. The import-list conflict
+in `crates/gpui/src/window.rs` keeps the dynamic texture types and adopts
+upstream `InputPreference`. Upstream atlas texture lookup now returns `Option`;
+a separate compatibility patch propagates a missing-texture error on DirectX
+and Metal instead of assuming a released texture exists. The README review
+marker is required by this repository's `.rules` for source changes.
+
+Windows validation with the upstream-pinned Rust 1.98.1 toolchain:
+
+```sh
+cargo check -p gpui -p gpui_platform -p gpui_windows -p gpui_wgpu
+cargo test -p gpui strided_update_preserves_pixels_outside_the_dirty_rectangle
+cargo test -p gpui typed_drag_can_be_handed_to_another_window
+cargo fmt -p gpui -p gpui_platform -p gpui_windows -p gpui_apple \
+  -p gpui_linux -p gpui_web -p gpui_wgpu -- --check
+```
+
+All passed. Metal and Linux compilation require their platform CI jobs and
+were not claimed as locally verified. MSVC emits proc-macro linker messages.
