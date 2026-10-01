@@ -66,6 +66,7 @@ impl PlatformAtlas for MetalAtlas {
         };
         lock.backend
             .texture(tile.texture_id)
+            .context("atlas tile refers to a missing texture")?
             .upload_with_stride(absolute, bytes, bytes_per_row);
         Ok(())
     }

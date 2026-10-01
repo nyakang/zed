@@ -103,12 +103,11 @@ impl PlatformAtlas for DirectXAtlas {
             origin: tile.bounds.origin + bounds.origin,
             size: bounds.size,
         };
-        lock.backend.texture(tile.texture_id).upload_with_stride(
-            &lock.backend.device_context,
-            absolute,
-            bytes,
-            bytes_per_row,
-        );
+        let texture = lock
+            .backend
+            .texture(tile.texture_id)
+            .ok_or_else(|| anyhow::anyhow!("atlas tile refers to a missing texture"))?;
+        texture.upload_with_stride(&lock.backend.device_context, absolute, bytes, bytes_per_row);
         Ok(())
     }
 }
