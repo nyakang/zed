@@ -1009,6 +1009,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn request_decorations(&self, _decorations: WindowDecorations) {}
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
+    /// Whether deferred virtual regular-file exports are implemented.
+    fn supports_virtual_file_drag(&self) -> bool {
+        false
+    }
+
     fn can_start_external_drag(&self) -> bool {
         false
     }

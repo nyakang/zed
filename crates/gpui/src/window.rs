@@ -5677,6 +5677,11 @@ impl Window {
         }
     }
 
+    /// Whether this window can export deferred regular files to native destinations.
+    pub fn supports_virtual_file_drag(&self) -> bool {
+        self.platform_window.supports_virtual_file_drag()
+    }
+
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
         let PlatformInput::MouseMove(mouse_move) = event else {
             return;

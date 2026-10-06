@@ -147,3 +147,19 @@ cargo fmt -p gpui -p gpui_platform -p gpui_windows -p gpui_apple \
 
 All passed. Metal and Linux compilation require their platform CI jobs and
 were not claimed as locally verified. MSVC emits proc-macro linker messages.
+
+
+## 2026-10-06 deferred file drag API
+
+Add transport-neutral VirtualFiles descriptors with cancellable, seekable content
+providers. Resolution only advertises metadata; native adapters request bounded
+64 KiB ranges on workers. Safe single Unicode names and case-fold duplicates are
+validated before export. Add a can_drag gesture predicate to preserve modifier
+selection, and an explicit virtual-file platform capability. macOS and Wayland
+retain their local Files behavior and reject VirtualFiles until their native
+adapters exist. The base remains 0544bd292a52fed9718e1ba9739c4ac82c41d223.
+
+Windows validation: cargo check -p gpui -p gpui_windows; cargo test -p gpui
+--features test-support virtual --lib (4 tests); existing Files promotion/re-entry
+regression passed. No new filesystem/network dependency enters GPUI. macOS and
+Linux compilation are not locally verified on this Windows host.

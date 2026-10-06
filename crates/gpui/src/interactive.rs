@@ -706,6 +706,8 @@ impl ExternalPaths {
 pub enum ExternalDragPayload {
     /// Real on-disk paths, handed to the platform as an outbound file drag.
     Files(FileDragPaths),
+    /// Deferred regular-file content, requested only by the native destination.
+    VirtualFiles(crate::VirtualFileDragPayload),
 }
 
 /// Paths handed to the platform for a native file drag. Directory metadata is

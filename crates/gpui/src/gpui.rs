@@ -65,6 +65,9 @@ pub mod test;
 mod text_system;
 mod util;
 mod view;
+mod virtual_file;
+#[cfg(test)]
+mod virtual_file_tests;
 mod window;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -212,6 +215,10 @@ pub use test::*;
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
+pub use virtual_file::{
+    VIRTUAL_FILE_CHUNK_SIZE, VirtualFileDescriptor, VirtualFileDragPayload, VirtualFileProvider,
+    VirtualFileStream,
+};
 pub use window::*;
 
 #[cfg(not(target_family = "wasm"))]
