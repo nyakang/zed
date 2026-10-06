@@ -163,3 +163,22 @@ Windows validation: cargo check -p gpui -p gpui_windows; cargo test -p gpui
 --features test-support virtual --lib (4 tests); existing Files promotion/re-entry
 regression passed. No new filesystem/network dependency enters GPUI. macOS and
 Linux compilation are not locally verified on this Windows host.
+
+
+### Windows native file exports
+
+Implement local CF_HDROP and deferred FILEDESCRIPTORW/FILECONTENTS exports using
+IDataObject, IDataObjectAsyncCapability and seekable IStream. A dedicated OLE STA
+runs DoDragDrop and pumps retained async consumers; a weak cancellation watcher
+handles window destruction and five minutes of inactivity even during a blocked
+Read. Active transfers have no total duration limit. Content remains unavailable
+while hovering. Source-window markers restore typed GPUI drags without fake local
+paths; a validated window message clears suspended drag state at native completion.
+Each content open is independent; stream Release cancels its provider work.
+
+Windows validation: cargo check -p gpui -p gpui_windows; cargo test -p gpui_windows
+--features test-support external_drag_tests --lib (9 tests); package formatting
+checks. Tests use a local mock provider and exercise Unicode/multiple/empty files,
+bounded reads, EOF/short-source errors, seeks/clones, cancellation, window lifetime,
+local CF_HDROP, hover probes and source markers. Manual Explorer/native desktop
+drag is NOT verified. macOS promises and Linux remote staging remain unsupported.
