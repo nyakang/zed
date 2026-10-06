@@ -182,3 +182,21 @@ checks. Tests use a local mock provider and exercise Unicode/multiple/empty file
 bounded reads, EOF/short-source errors, seeks/clones, cancellation, window lifetime,
 local CF_HDROP, hover probes and source markers. Manual Explorer/native desktop
 drag is NOT verified. macOS promises and Linux remote staging remain unsupported.
+
+
+## 2026-10-07 native drag input handoff
+
+The dedicated drag STA did not inherit the initiating window thread's button or
+foreground input state. Attach its message queue to the source queue for the
+DoDragDrop gesture and restore the source keyboard snapshot after attachment
+(which resets key state). Detach immediately after DoDragDrop; retained async
+content streams do not keep input queues associated. Reconcile held keys on the
+validated source completion event. Trace only the HRESULT/effect, never file
+paths, contents or credentials. The test platform now advertises its already
+implemented virtual-file drag support for application-level gesture regressions.
+
+Validation on Windows: cargo check -p gpui -p gpui_windows; native export suite
+10 tests including a real two-thread Win32 input-queue handoff and reattachment;
+GPUI virtual-drag suite 4 tests; package formatting. NyaTerm adds visible file
+previews and first-press row dragging in its own views. Manual Explorer gestures
+still require user validation and are not claimed by this patch.

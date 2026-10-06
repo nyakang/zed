@@ -42,16 +42,19 @@ use windows::{
                 IDropSource_Impl, OleInitialize, OleUninitialize, ReleaseStgMedium,
             },
             SystemServices::MK_LBUTTON,
+            Threading::{AttachThreadInput, GetCurrentThreadId},
         },
         UI::{
+            Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState},
             Shell::{
                 DROPFILES, FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FD_WRITESTIME,
                 FILEDESCRIPTORW, IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl,
                 SHCreateStdEnumFmtEtc,
             },
             WindowsAndMessaging::{
-                DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
-                PeekMessageW, PostMessageW, QS_ALLINPUT, TranslateMessage,
+                DispatchMessageW, GetWindowThreadProcessId, MSG, MWMO_INPUTAVAILABLE,
+                MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
+                TranslateMessage,
             },
         },
     },
@@ -104,6 +107,17 @@ pub(crate) fn start(
     if matches!(&payload, ExternalDragPayload::Files(paths) if paths.entries().is_empty()) {
         return false;
     }
+    let mut keyboard = [0_u8; 256];
+    if unsafe { GetKeyboardState(&mut keyboard) }
+        .log_err()
+        .is_none()
+    {
+        return false;
+    }
+    let source_thread = unsafe { GetWindowThreadProcessId(HWND(source_hwnd as *mut c_void), None) };
+    if source_thread == 0 {
+        return false;
+    }
     std::thread::Builder::new()
         .name("gpui-file-drag".into())
         .spawn(move || {
@@ -129,6 +143,22 @@ pub(crate) fn start(
                     log::warn!("could not initialize native file drag");
                     return;
                 }
+                let input = match DragInputGuard::attach(source_thread, &keyboard) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        session.cancel();
+                        PostMessageW(
+                            Some(HWND(source_hwnd as *mut c_void)),
+                            crate::events::WM_GPUI_NATIVE_DRAG_ENDED,
+                            WPARAM(source_validation),
+                            LPARAM(0),
+                        )
+                        .log_err();
+                        log::warn!("could not hand off native file drag input: {error}");
+                        OleUninitialize();
+                        return;
+                    }
+                };
                 let stopped = Arc::new(AtomicBool::new(false));
                 let watch_stopped = stopped.clone();
                 let watch_session = Arc::downgrade(&session);
@@ -155,6 +185,7 @@ pub(crate) fn start(
                     Ok(watcher) => watcher,
                     Err(_) => {
                         session.cancel();
+                        drop(input);
                         PostMessageW(
                             Some(HWND(source_hwnd as *mut c_void)),
                             crate::events::WM_GPUI_NATIVE_DRAG_ENDED,
@@ -181,6 +212,10 @@ pub(crate) fn start(
                 .into();
                 let mut effect = DROPEFFECT_NONE;
                 let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+                // Only the gesture needs shared foreground input. Retained Shell
+                // streams must not keep the GPUI input queue attached during copying.
+                drop(input);
+                log::debug!("native file drag ended: result={result:?}, effect={effect:?}");
                 PostMessageW(
                     Some(HWND(source_hwnd as *mut c_void)),
                     crate::events::WM_GPUI_NATIVE_DRAG_ENDED,
@@ -218,6 +253,39 @@ pub(crate) fn start(
             }
         })
         .is_ok()
+}
+
+pub(crate) struct DragInputGuard {
+    thread: u32,
+    source: u32,
+}
+impl DragInputGuard {
+    pub(crate) fn attach(source: u32, keyboard: &[u8; 256]) -> Result<Self> {
+        let thread = unsafe { GetCurrentThreadId() };
+        // AttachThreadInput needs both message queues. It also resets keyboard
+        // state, so restore the initiating UI thread's snapshot before OLE probes it.
+        let mut message = MSG::default();
+        unsafe {
+            let _ = PeekMessageW(
+                &mut message,
+                None,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+            );
+        };
+        unsafe { AttachThreadInput(thread, source, true) }.ok()?;
+        let guard = Self { thread, source };
+        unsafe { SetKeyboardState(keyboard) }?;
+        Ok(guard)
+    }
+}
+impl Drop for DragInputGuard {
+    fn drop(&mut self) {
+        unsafe { AttachThreadInput(self.thread, self.source, false) }
+            .ok()
+            .log_err();
+    }
 }
 
 #[implement(IDropSource)]

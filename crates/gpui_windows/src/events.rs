@@ -112,6 +112,16 @@ impl WindowsWindowInner {
         let handled = match msg {
             WM_GPUI_NATIVE_DRAG_ENDED => {
                 if wparam.0 == self.validation_number {
+                    // Detaching the OLE input queue resets key state. Reconcile
+                    // held modifiers before returning input to this window.
+                    let mut keyboard = [0_u8; 256];
+                    if unsafe { GetKeyboardState(&mut keyboard) }.log_err().is_some() {
+                        for (key, state) in keyboard.iter_mut().enumerate() {
+                            let pressed = unsafe { GetAsyncKeyState(key as i32) } < 0;
+                            *state = (*state & 1) | if pressed { 0x80 } else { 0 };
+                        }
+                        unsafe { SetKeyboardState(&keyboard) }.log_err();
+                    }
                     if let Some(mut callback) = self.state.callbacks.input.take() {
                         callback(PlatformInput::FileDrop(FileDropEvent::Ended));
                         self.state.callbacks.input.set(Some(callback));

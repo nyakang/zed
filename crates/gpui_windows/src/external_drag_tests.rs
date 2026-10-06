@@ -1,4 +1,6 @@
-use crate::external_drag::{ContentStream, DragDataObject, DragExportSession, format};
+use crate::external_drag::{
+    ContentStream, DragDataObject, DragExportSession, DragInputGuard, format,
+};
 use gpui::{
     ExternalDragPayload, FileDragPaths, VIRTUAL_FILE_CHUNK_SIZE, VirtualFileDescriptor,
     VirtualFileDragPayload, VirtualFileProvider, VirtualFileStream,
@@ -324,4 +326,43 @@ fn source_marker_restores_only_its_original_window() {
     assert!(crate::external_drag::is_source_drag(&data, 7));
     assert!(!crate::external_drag::is_source_drag(&data, 8));
     assert_eq!(source.opens.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn native_worker_handoff_preserves_initiating_button_and_modifier_state() {
+    use windows::Win32::{
+        System::Threading::GetCurrentThreadId,
+        UI::{
+            Input::KeyboardAndMouse::{GetKeyboardState, VK_LBUTTON, VK_SHIFT},
+            WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW},
+        },
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let source = std::thread::spawn(move || {
+        unsafe {
+            let mut message = MSG::default();
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            ready_tx.send(GetCurrentThreadId()).unwrap();
+        }
+        stop_rx.recv().unwrap();
+    });
+    let source_thread = ready_rx.recv().unwrap();
+    let worker = std::thread::spawn(move || {
+        let mut keyboard = [0_u8; 256];
+        keyboard[VK_LBUTTON.0 as usize] = 0x80;
+        keyboard[VK_SHIFT.0 as usize] = 0x80;
+        let input = DragInputGuard::attach(source_thread, &keyboard).unwrap();
+        let mut actual = [0_u8; 256];
+        unsafe { GetKeyboardState(&mut actual) }.unwrap();
+        assert_eq!(actual[VK_LBUTTON.0 as usize] & 0x80, 0x80);
+        assert_eq!(actual[VK_SHIFT.0 as usize] & 0x80, 0x80);
+        drop(input);
+        // Reattachment also succeeds after cleanup; the guard leaves no association.
+        drop(DragInputGuard::attach(source_thread, &[0_u8; 256]).unwrap());
+    });
+    let result = worker.join();
+    stop_tx.send(()).unwrap();
+    source.join().unwrap();
+    result.unwrap();
 }

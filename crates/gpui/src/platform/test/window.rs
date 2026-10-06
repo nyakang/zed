@@ -581,6 +581,10 @@ impl PlatformWindow for TestWindow {
         true
     }
 
+    fn supports_virtual_file_drag(&self) -> bool {
+        true
+    }
+
     fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
         let mut state = self.0.lock();
         match payload {
