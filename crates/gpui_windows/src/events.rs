@@ -115,7 +115,10 @@ impl WindowsWindowInner {
                     // Detaching the OLE input queue resets key state. Reconcile
                     // held modifiers before returning input to this window.
                     let mut keyboard = [0_u8; 256];
-                    if unsafe { GetKeyboardState(&mut keyboard) }.log_err().is_some() {
+                    if unsafe { GetKeyboardState(&mut keyboard) }
+                        .log_err()
+                        .is_some()
+                    {
                         for (key, state) in keyboard.iter_mut().enumerate() {
                             let pressed = unsafe { GetAsyncKeyState(key as i32) } < 0;
                             *state = (*state & 1) | if pressed { 0x80 } else { 0 };
