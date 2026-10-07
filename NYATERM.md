@@ -226,3 +226,17 @@ Windows validation: 11 native export tests passed, including hierarchy attribute
 empty directories, reserved content indexes and deferred enumeration/opening.
 Existing cancellation, asynchronous lifetime, input handoff, seek and clone tests
 remain green. Native Explorer directory gestures still require manual validation.
+
+
+## 2026-10-07 Finder file promises
+
+Offer NSFilePromiseProvider items for files and directories. Retain the weak
+promise delegate through userInfo, use a dedicated NSOperationQueue for writes,
+and pass Finder's final file URL into the application provider. Complete exactly
+once with an NSError on provider failure or panic. Delegate release cancels the
+provider and no application Entity is retained. Local NSURL drags retain their
+existing behavior. CI now compiles gpui_macos as well as the Metal renderer.
+
+Formatting passed on Windows. Native macOS compilation is delegated to the branch
+CI; Finder cancellation, collision naming and live SFTP drops require a macOS
+manual check and are not claimed by this commit.

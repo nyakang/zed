@@ -58,7 +58,7 @@ jobs:
         include:
           - name: metal atlas (macos)
             os: macos-latest
-            args: -p gpui_apple
+            args: -p gpui_apple -p gpui_macos
           - name: directx atlas (windows)
             os: windows-latest
             args: -p gpui_windows
