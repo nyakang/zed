@@ -1010,6 +1010,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
     /// Whether deferred virtual regular-file exports are implemented.
+    /// Whether the native receiver can supply a destination for promised files.
+    fn supports_file_promise_drag(&self) -> bool {
+        false
+    }
+
     fn supports_virtual_file_drag(&self) -> bool {
         false
     }

@@ -1,7 +1,15 @@
 //! Deferred file content for native drag destinations. Payload resolution performs no IO.
 
 use smallvec::SmallVec;
-use std::{ffi::OsString, fmt, io, sync::Arc, time::SystemTime};
+use std::{
+    ffi::OsString,
+    fmt, io,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::SystemTime,
+};
 
 /// Maximum content request; adapters split larger reads into bounded chunks.
 pub const VIRTUAL_FILE_CHUNK_SIZE: usize = 64 * 1024;
@@ -26,8 +34,10 @@ pub trait VirtualFileStream: Send + 'static {
 /// Metadata advertised before a destination requests content.
 #[derive(Clone)]
 pub struct VirtualFileDescriptor {
-    /// A single safe filename, never a destination path.
+    /// A safe relative name (backslash-separated for trees), never a destination.
     pub name: OsString,
+    /// Directories have metadata only; content indexes are reserved for files.
+    pub is_directory: bool,
     /// Optional advertised length.
     pub size: Option<u64>,
     /// Optional last modification time.
@@ -48,6 +58,7 @@ impl fmt::Debug for VirtualFileDescriptor {
 impl PartialEq for VirtualFileDescriptor {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+            && self.is_directory == other.is_directory
             && self.size == other.size
             && self.modified_at == other.modified_at
             && Arc::ptr_eq(&self.provider, &other.provider)
@@ -61,48 +72,77 @@ pub struct VirtualFileDragPayload(SmallVec<[VirtualFileDescriptor; 2]>);
 impl VirtualFileDragPayload {
     /// Validate every filename before advertising the payload.
     pub fn new(files: impl IntoIterator<Item = VirtualFileDescriptor>) -> io::Result<Self> {
+        Self::validate(files, false)
+    }
+    /// Validate a parent-before-child descriptor tree, including empty directories.
+    pub fn new_tree(files: impl IntoIterator<Item = VirtualFileDescriptor>) -> io::Result<Self> {
+        Self::validate(files, true)
+    }
+    fn validate(
+        files: impl IntoIterator<Item = VirtualFileDescriptor>,
+        tree: bool,
+    ) -> io::Result<Self> {
         let files: SmallVec<[VirtualFileDescriptor; 2]> = files.into_iter().collect();
-        if files.is_empty() || files.len() > 1024 {
+        if files.is_empty() || files.len() > 65536 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid virtual file count",
             ));
         }
         let mut names = std::collections::HashSet::new();
+        let mut directories = std::collections::HashSet::new();
         for file in &files {
             let name = file.name.to_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "filename is not Unicode")
             })?;
-            let stem = name
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_uppercase();
-            let reserved_port = stem
-                .strip_prefix("COM")
-                .or_else(|| stem.strip_prefix("LPT"))
-                .is_some_and(|suffix| {
-                    matches!(
-                        suffix,
-                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-                    )
-                });
-            if name.is_empty()
-                || name == "."
-                || name == ".."
-                || name.ends_with(['.', ' '])
-                || name
-                    .chars()
-                    .any(|c| c.is_control() || "/\\:<>\"|?*".contains(c))
-                || name.encode_utf16().count() >= 260
-                || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                || reserved_port
-                || !names.insert(name.to_lowercase())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unsafe or duplicate virtual filename",
-                ));
+            if tree {
+                if let Some((parent, _)) = name.rsplit_once('\\') {
+                    if !directories.contains(&parent.to_lowercase()) {
+                        return Err(io::ErrorKind::InvalidInput.into());
+                    }
+                }
+            }
+            let full_name = name;
+            if full_name.contains('\0') {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            for name in name.split(if tree { '\\' } else { '\0' }) {
+                let stem = name
+                    .split('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let reserved_port = stem
+                    .strip_prefix("COM")
+                    .or_else(|| stem.strip_prefix("LPT"))
+                    .is_some_and(|suffix| {
+                        matches!(
+                            suffix,
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                        )
+                    });
+                if name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.ends_with(['.', ' '])
+                    || name
+                        .chars()
+                        .any(|c| c.is_control() || "/\\:<>\"|?*".contains(c))
+                    || full_name.encode_utf16().count() >= 260
+                    || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                    || reserved_port
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unsafe or duplicate virtual filename",
+                    ));
+                }
+            }
+            if !names.insert(full_name.to_lowercase()) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            if file.is_directory {
+                directories.insert(full_name.to_lowercase());
             }
         }
         Ok(Self(files))
@@ -115,6 +155,75 @@ impl VirtualFileDragPayload {
     pub fn cancel(&self) {
         for file in &self.0 {
             file.provider.cancel();
+        }
+    }
+}
+
+/// Enumerates a virtual tree on the native worker. No file contents are read.
+pub trait VirtualFileTreeProvider: Send + Sync + 'static {
+    /// Load and validate the entire immutable descriptor tree on a worker.
+    fn load(&self) -> io::Result<VirtualFileDragPayload>;
+    /// Cancel enumeration without blocking the caller.
+    fn cancel(&self);
+}
+struct DeferredTree {
+    source: Arc<dyn VirtualFileTreeProvider>,
+    result: OnceLock<io::Result<VirtualFileDragPayload>>,
+    cancelled: AtomicBool,
+}
+/// Lazily frozen native descriptor tree. Resolution errors are cached as well.
+#[derive(Clone)]
+pub struct DeferredVirtualFileDragPayload(Arc<DeferredTree>);
+impl fmt::Debug for DeferredVirtualFileDragPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredVirtualFileDragPayload")
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for DeferredVirtualFileDragPayload {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for DeferredVirtualFileDragPayload {}
+impl DeferredVirtualFileDragPayload {
+    /// Wrap a source without enumerating it or opening any content.
+    pub fn new(source: Arc<dyn VirtualFileTreeProvider>) -> Self {
+        Self(Arc::new(DeferredTree {
+            source,
+            result: OnceLock::new(),
+            cancelled: AtomicBool::new(false),
+        }))
+    }
+    /// May block; native workers only. The validated result is frozen for all indexes.
+    pub fn resolve(&self) -> io::Result<&VirtualFileDragPayload> {
+        if self.0.cancelled.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let result = self.0.result.get_or_init(|| self.0.source.load());
+        if self.0.cancelled.load(Ordering::Acquire) {
+            self.cancel();
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        match result {
+            Ok(files) => Ok(files),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        }
+    }
+    /// Cancel enumeration and every stream created from the resolved tree.
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.source.cancel();
+        if let Some(Ok(files)) = self.0.result.get() {
+            files.cancel();
+        }
+    }
+}
+impl Drop for DeferredTree {
+    fn drop(&mut self) {
+        self.source.cancel();
+        if let Some(Ok(files)) = self.result.get() {
+            files.cancel();
         }
     }
 }
@@ -142,10 +251,77 @@ mod tests {
     fn descriptor(name: &str, source: Arc<Source>) -> VirtualFileDescriptor {
         VirtualFileDescriptor {
             name: name.into(),
+            is_directory: false,
             size: Some(0),
             modified_at: None,
             provider: source,
         }
+    }
+    #[test]
+    fn tree_preserves_empty_directories_and_rejects_missing_or_unsafe_parents() {
+        let source = Arc::new(Source(AtomicUsize::new(0)));
+        let mut directory = descriptor("folder", source.clone());
+        directory.is_directory = true;
+        let mut empty = descriptor("folder\\empty", source.clone());
+        empty.is_directory = true;
+        let payload = VirtualFileDragPayload::new_tree([
+            directory.clone(),
+            empty,
+            descriptor("folder\\data.txt", source.clone()),
+        ])
+        .unwrap();
+        assert_eq!(payload.files().len(), 3);
+        assert!(payload.files()[1].is_directory);
+        assert_eq!(source.0.load(Ordering::SeqCst), 0);
+        for name in [
+            "folder\\..\\escape",
+            "folder\\NUL.txt",
+            "folder\\name:stream",
+            "folder\\a\0b",
+            "folder\\",
+            "missing\\file",
+        ] {
+            assert!(
+                VirtualFileDragPayload::new_tree([
+                    directory.clone(),
+                    descriptor(name, source.clone())
+                ])
+                .is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(
+            VirtualFileDragPayload::new_tree([
+                descriptor("folder", source.clone()),
+                descriptor("folder\\file", source)
+            ])
+            .is_err()
+        );
+    }
+    struct TreeSource(Arc<Source>, AtomicUsize);
+    impl super::VirtualFileTreeProvider for TreeSource {
+        fn load(&self) -> io::Result<VirtualFileDragPayload> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            VirtualFileDragPayload::new([descriptor("file", self.0.clone())])
+        }
+        fn cancel(&self) {}
+    }
+    #[test]
+    fn deferred_tree_is_frozen_once_and_cancel_before_resolve_never_enumerates() {
+        let source = Arc::new(TreeSource(
+            Arc::new(Source(AtomicUsize::new(0))),
+            AtomicUsize::new(0),
+        ));
+        let payload = super::DeferredVirtualFileDragPayload::new(source.clone());
+        assert_eq!(source.1.load(Ordering::SeqCst), 0);
+        assert_eq!(payload.resolve().unwrap().files().len(), 1);
+        assert_eq!(payload.resolve().unwrap().files().len(), 1);
+        assert_eq!(source.1.load(Ordering::SeqCst), 1);
+        assert_eq!(source.0.0.load(Ordering::SeqCst), 0);
+        let cancelled = super::DeferredVirtualFileDragPayload::new(source.clone());
+        cancelled.cancel();
+        assert!(cancelled.resolve().is_err());
+        assert_eq!(source.1.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn metadata_and_cancel_never_open_content() {

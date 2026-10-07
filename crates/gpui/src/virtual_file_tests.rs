@@ -39,6 +39,7 @@ impl Render for DragView {
                 resolutions.set(resolutions.get() + 1);
                 Some(ExternalDragPayload::VirtualFiles(
                     VirtualFileDragPayload::new([VirtualFileDescriptor {
+                        is_directory: false,
                         name: "你好.txt".into(),
                         size: Some(0),
                         modified_at: None,

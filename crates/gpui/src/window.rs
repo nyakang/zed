@@ -5677,7 +5677,12 @@ impl Window {
         }
     }
 
-    /// Whether this window can export deferred regular files to native destinations.
+    /// Whether this window supports writing file promises after a native drop.
+    pub fn supports_file_promise_drag(&self) -> bool {
+        self.platform_window.supports_file_promise_drag()
+    }
+
+    /// Whether this window supports deferred native file content.
     pub fn supports_virtual_file_drag(&self) -> bool {
         self.platform_window.supports_virtual_file_drag()
     }

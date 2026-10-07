@@ -591,6 +591,8 @@ impl PlatformWindow for TestWindow {
             crate::ExternalDragPayload::Files(paths) => {
                 state.external_drag_files.extend_from_slice(paths.entries());
             }
+            crate::ExternalDragPayload::VirtualFileTree(_)
+            | crate::ExternalDragPayload::PromisedFiles(_) => return false,
             crate::ExternalDragPayload::VirtualFiles(files) => {
                 state
                     .external_drag_virtual_names

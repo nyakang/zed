@@ -200,3 +200,16 @@ Validation on Windows: cargo check -p gpui -p gpui_windows; native export suite
 GPUI virtual-drag suite 4 tests; package formatting. NyaTerm adds visible file
 previews and first-press row dragging in its own views. Manual Explorer gestures
 still require user validation and are not claimed by this patch.
+
+
+## 2026-10-07 virtual directory and native promise contracts
+
+Add parent-before-child virtual tree descriptors with directory attributes and
+worker-only lazy enumeration. Freeze the descriptor tree (including failures)
+exactly once; cancellation never enumerates it. Add transport-neutral top-level
+file promises and a capability query for receiver-supplied destinations. Tree
+validation rejects traversal, missing/non-directory parents, duplicate paths,
+unsafe Windows components, NULs and overlong descriptor paths before advertising.
+
+Windows validation: GPUI virtual suite, 6 tests passed; package formatting and
+cargo check -p gpui -p gpui_windows passed. Provider content remains deferred.
