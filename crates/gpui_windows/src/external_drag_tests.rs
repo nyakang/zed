@@ -464,8 +464,15 @@ fn native_completion_is_reported_once_even_when_cancel_and_release_follow() {
             .unwrap()
             .with_observer(observer.clone());
     let session = session(ExternalDragPayload::VirtualFiles(payload), &lifetime);
-    session.finish(gpui::NativeFileDragOutcome::Provided);
-    session.finish(gpui::NativeFileDragOutcome::Failed);
+    let data = data(session.clone());
+    let capability: IDataObjectAsyncCapability = data.cast().unwrap();
+    unsafe {
+        capability.StartOperation(None).unwrap();
+        capability.EndOperation(S_OK, None, 0).unwrap();
+        capability.EndOperation(STG_E_READFAULT, None, 0).unwrap();
+    }
+    drop(capability);
+    drop(data);
     session.cancel();
     drop(session);
     assert_eq!(

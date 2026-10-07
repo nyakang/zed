@@ -130,7 +130,10 @@ impl DragExportSession {
                     .map_err(|_| STG_E_READFAULT)
             }) {
                 Ok(payload) => Ok(payload),
-                Err(error) => Err((*error).into()),
+                Err(error) => {
+                    self.failed.store(true, Ordering::Release);
+                    Err((*error).into())
+                }
             }
         } else {
             Ok(&self.payload)

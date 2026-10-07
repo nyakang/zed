@@ -316,3 +316,12 @@ macOS CI compiles and executes it. Local URL dragging is unchanged.
 
 Validation: rustfmt on Windows. macOS native compilation/test results must be
 confirmed by branch CI; interactive Finder directory recovery remains pending.
+
+
+## 2026-10-07 failed descriptor enumeration
+
+Preserve a deferred enumeration error as a native delivery failure even when a
+synchronous target releases without calling EndOperation. Validation: Windows
+export suite (13 passed); the one-shot observer test uses real COM EndOperation
+dispatch. Three-platform CI passed for preceding d24d377526, including the
+macOS promise delegate ABI test: run 37620647522. Final revision is rechecked.
