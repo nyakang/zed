@@ -1,8 +1,7 @@
 use block2::DynBlock;
 use gpui::PromisedFileDescriptor;
 use objc2::{
-    AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, rc::Retained,
-    runtime::ProtocolObject,
+    AnyThread, DefinedClass, define_class, msg_send, rc::Retained, runtime::ProtocolObject,
 };
 use objc2_app_kit::{NSFilePromiseProvider, NSFilePromiseProviderDelegate};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSOperationQueue, NSString, NSURL};
@@ -30,21 +29,16 @@ define_class!(
 
     unsafe impl NSObjectProtocol for FilePromiseDelegate {}
     unsafe impl NSFilePromiseProviderDelegate for FilePromiseDelegate {
-        #[unsafe(method(filePromiseProvider:fileNameForType:))]
+        #[unsafe(method_id(filePromiseProvider:fileNameForType:))]
         fn file_name(
             &self,
             _provider: &NSFilePromiseProvider,
             _file_type: &NSString,
-            _mtm: MainThreadMarker,
         ) -> Retained<NSString> {
             NSString::from_str(&self.ivars().file.name.to_string_lossy())
         }
-        #[unsafe(method(operationQueueForFilePromiseProvider:))]
-        fn operation_queue(
-            &self,
-            _provider: &NSFilePromiseProvider,
-            _mtm: MainThreadMarker,
-        ) -> Retained<NSOperationQueue> {
+        #[unsafe(method_id(operationQueueForFilePromiseProvider:))]
+        fn operation_queue(&self, _provider: &NSFilePromiseProvider) -> Retained<NSOperationQueue> {
             self.ivars().queue.clone()
         }
         #[unsafe(method(filePromiseProvider:writePromiseToURL:completionHandler:))]
@@ -70,11 +64,13 @@ define_class!(
                 completion.call((std::ptr::null_mut(),));
             } else {
                 // Do not expose remote paths, terminal data, or credentials in diagnostics.
-                let error = NSError::errorWithDomain_code_userInfo(
-                    &NSString::from_str("GPUIFilePromise"),
-                    1,
-                    None,
-                );
+                let error = unsafe {
+                    NSError::errorWithDomain_code_userInfo(
+                        &NSString::from_str("GPUIFilePromise"),
+                        1,
+                        None,
+                    )
+                };
                 completion.call((Retained::as_ptr(&error).cast_mut(),));
             }
         }

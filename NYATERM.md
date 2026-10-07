@@ -252,3 +252,13 @@ remote staging paths cannot be moved out from under a reusable prepared export.
 Both backends require completed local sources; direct-save protocols are not
 advertised. Formatting passed; Linux compilation runs in branch CI. Live Nautilus,
 Dolphin and compositor gestures need manual validation on those desktops.
+
+
+## 2026-10-07 AppKit delegate ABI follow-up
+
+The native macOS branch compile found that define_class delegate implementations
+must omit Rust-only MainThreadMarker parameters and use method_id for retained
+Objective-C return values. Correct both signatures and mark NSError construction
+unsafe with its fixed-domain, no-userInfo contract. Windows formatting passes;
+macOS compilation is rerun in branch CI. This is an ABI correction, not a change
+to the promise destination or application data contracts.
