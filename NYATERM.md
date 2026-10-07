@@ -240,3 +240,15 @@ existing behavior. CI now compiles gpui_macos as well as the Metal renderer.
 Formatting passed on Windows. Native macOS compilation is delegated to the branch
 CI; Finder cancellation, collision naming and live SFTP drops require a macOS
 manual check and are not claimed by this commit.
+
+
+## 2026-10-07 Linux local URI drag export
+
+Add X11 Xdnd copy-source negotiation, pointer/keyboard ownership, Escape/window
+cancellation, URI selection delivery, directory/multi-file support and bounded
+receiver lifetime on a separate X11 connection. Finish on the foreground queue
+with the same GPUI drag-exit event used by Wayland. Wayland offers copy only so
+remote staging paths cannot be moved out from under a reusable prepared export.
+Both backends require completed local sources; direct-save protocols are not
+advertised. Formatting passed; Linux compilation runs in branch CI. Live Nautilus,
+Dolphin and compositor gestures need manual validation on those desktops.
