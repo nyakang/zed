@@ -11,7 +11,7 @@ use std::{
     mem::{ManuallyDrop, size_of},
     os::windows::ffi::OsStrExt,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Instant, UNIX_EPOCH},
@@ -63,6 +63,7 @@ use windows::{
 
 pub(crate) struct DragExportSession {
     pub(crate) payload: ExternalDragPayload,
+    pub(crate) resolved_payload: OnceLock<std::result::Result<ExternalDragPayload, HRESULT>>,
     pub(crate) cancelled: AtomicBool,
     pub(crate) content_allowed: AtomicBool,
     pub(crate) window_lifetime: Weak<()>,
@@ -74,9 +75,25 @@ pub(crate) struct DragExportSession {
 impl DragExportSession {
     pub(crate) fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::AcqRel) {
-            if let ExternalDragPayload::VirtualFiles(files) = &self.payload {
-                files.cancel();
+            match &self.payload {
+                ExternalDragPayload::VirtualFiles(files) => files.cancel(),
+                ExternalDragPayload::VirtualFileTree(tree) => tree.cancel(),
+                _ => {}
             }
+        }
+    }
+    fn payload(&self) -> Result<&ExternalDragPayload> {
+        if let ExternalDragPayload::VirtualFileTree(tree) = &self.payload {
+            match self.resolved_payload.get_or_init(|| {
+                tree.resolve()
+                    .map(|files| ExternalDragPayload::VirtualFiles(files.clone()))
+                    .map_err(|_| STG_E_READFAULT)
+            }) {
+                Ok(payload) => Ok(payload),
+                Err(error) => Err((*error).into()),
+            }
+        } else {
+            Ok(&self.payload)
         }
     }
     fn touch(&self) {
@@ -104,6 +121,9 @@ pub(crate) fn start(
     source_hwnd: isize,
     source_validation: usize,
 ) -> bool {
+    if matches!(&payload, ExternalDragPayload::PromisedFiles(_)) {
+        return false;
+    }
     if matches!(&payload, ExternalDragPayload::Files(paths) if paths.entries().is_empty()) {
         return false;
     }
@@ -123,6 +143,7 @@ pub(crate) fn start(
         .spawn(move || {
             let session = Arc::new(DragExportSession {
                 payload,
+                resolved_payload: OnceLock::new(),
                 cancelled: AtomicBool::new(false),
                 content_allowed: AtomicBool::new(false),
                 window_lifetime,
@@ -334,20 +355,25 @@ pub(crate) fn format(id: u16, medium: TYMED, index: i32) -> FORMATETC {
 }
 
 impl DragDataObject {
-    fn formats(&self) -> Vec<FORMATETC> {
-        let mut formats = match &self.session.payload {
+    fn formats(&self) -> Result<Vec<FORMATETC>> {
+        let mut formats = match self.session.payload()? {
             ExternalDragPayload::Files(_) => vec![format(CF_HDROP.0, TYMED_HGLOBAL, -1)],
             ExternalDragPayload::VirtualFiles(files) => {
                 let mut formats = vec![format(self.descriptor_format, TYMED_HGLOBAL, -1)];
                 formats.extend(
-                    (0..files.files().len())
-                        .map(|i| format(self.content_format, TYMED_ISTREAM, i as i32)),
+                    files
+                        .files()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, file)| !file.is_directory)
+                        .map(|(i, _)| format(self.content_format, TYMED_ISTREAM, i as i32)),
                 );
                 formats
             }
+            _ => return Err(DV_E_FORMATETC.into()),
         };
         formats.push(format(source_marker_format(), TYMED_HGLOBAL, -1));
-        formats
+        Ok(formats)
     }
     fn query(&self, requested: &FORMATETC) -> HRESULT {
         if self.session.is_cancelled() {
@@ -359,7 +385,10 @@ impl DragDataObject {
         if requested.dwAspect != DVASPECT_CONTENT.0 {
             return DV_E_DVASPECT;
         }
-        let formats = self.formats();
+        let formats = match self.formats() {
+            Ok(formats) => formats,
+            Err(error) => return error.code(),
+        };
         if !formats.iter().any(|f| f.cfFormat == requested.cfFormat) {
             return DV_E_FORMATETC;
         }
@@ -391,7 +420,7 @@ impl IDataObject_Impl for DragDataObject_Impl {
                 (u128::from(std::process::id()) << 64) | self.session.source_validation as u128;
             return global_medium(&marker.to_le_bytes());
         }
-        match &self.session.payload {
+        match self.session.payload()? {
             ExternalDragPayload::Files(paths) => {
                 let mut names = Vec::<u16>::new();
                 for (path, _) in paths.entries() {
@@ -431,8 +460,11 @@ impl IDataObject_Impl for DragDataObject_Impl {
                 for (index, file) in files.files().iter().enumerate() {
                     let mut descriptor = FILEDESCRIPTORW {
                         dwFlags: FD_ATTRIBUTES.0 as u32 | FD_PROGRESSUI.0 as u32,
-                        dwFileAttributes:
-                            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL.0,
+                        dwFileAttributes: if file.is_directory {
+                            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0
+                        } else {
+                            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL.0
+                        },
                         ..Default::default()
                     };
                     let mut name = [0_u16; 260];
@@ -473,7 +505,12 @@ impl IDataObject_Impl for DragDataObject_Impl {
                 global_medium(&bytes)
             }
             ExternalDragPayload::VirtualFiles(files) => {
-                let descriptor = files.files()[requested.lindex as usize].clone();
+                let descriptor = files
+                    .files()
+                    .get(requested.lindex as usize)
+                    .filter(|file| !file.is_directory)
+                    .ok_or_else(|| windows::core::Error::from_hresult(DV_E_LINDEX))?
+                    .clone();
                 // Opening is metadata-only. Network work begins with the first Read.
                 let stream: IStream = ContentStream::new(descriptor, self.session.clone()).into();
                 Ok(STGMEDIUM {
@@ -484,6 +521,7 @@ impl IDataObject_Impl for DragDataObject_Impl {
                     ..Default::default()
                 })
             }
+            _ => Err(DV_E_FORMATETC.into()),
         }
     }
     fn GetDataHere(&self, _: *const FORMATETC, _: *mut STGMEDIUM) -> Result<()> {
@@ -508,7 +546,7 @@ impl IDataObject_Impl for DragDataObject_Impl {
         if direction != DATADIR_GET.0 as u32 {
             return Err(E_NOTIMPL.into());
         }
-        unsafe { SHCreateStdEnumFmtEtc(&self.formats()) }
+        unsafe { SHCreateStdEnumFmtEtc(&self.formats()?) }
     }
     fn DAdvise(&self, _: *const FORMATETC, _: u32, _: Ref<IAdviseSink>) -> Result<u32> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())

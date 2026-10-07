@@ -213,3 +213,16 @@ unsafe Windows components, NULs and overlong descriptor paths before advertising
 
 Windows validation: GPUI virtual suite, 6 tests passed; package formatting and
 cargo check -p gpui -p gpui_windows passed. Provider content remains deferred.
+
+
+## 2026-10-07 Windows virtual directory export
+
+Resolve lazy trees inside the OLE STA. Emit FILE_ATTRIBUTE_DIRECTORY for empty
+and non-empty directories, preserving each file's original descriptor lindex.
+Only ordinary files offer FILECONTENTS streams. Explorer owns destination naming
+and final writes; no destination path is invented by this adapter.
+
+Windows validation: 11 native export tests passed, including hierarchy attributes,
+empty directories, reserved content indexes and deferred enumeration/opening.
+Existing cancellation, asynchronous lifetime, input handoff, seek and clone tests
+remain green. Native Explorer directory gestures still require manual validation.

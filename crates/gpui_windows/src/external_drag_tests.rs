@@ -84,6 +84,7 @@ fn source(bytes: Vec<u8>, fail: bool) -> Arc<MockSource> {
 }
 fn descriptor(name: &str, source: Arc<MockSource>) -> VirtualFileDescriptor {
     VirtualFileDescriptor {
+        is_directory: false,
         name: name.into(),
         size: Some(source.content.len() as u64),
         modified_at: None,
@@ -93,6 +94,7 @@ fn descriptor(name: &str, source: Arc<MockSource>) -> VirtualFileDescriptor {
 fn session(payload: ExternalDragPayload, lifetime: &Arc<()>) -> Arc<DragExportSession> {
     Arc::new(DragExportSession {
         payload,
+        resolved_payload: std::sync::OnceLock::new(),
         cancelled: AtomicBool::new(false),
         content_allowed: AtomicBool::new(true),
         window_lifetime: Arc::downgrade(lifetime),
@@ -365,4 +367,80 @@ fn native_worker_handoff_preserves_initiating_button_and_modifier_state() {
     stop_tx.send(()).unwrap();
     source.join().unwrap();
     result.unwrap();
+}
+
+#[test]
+fn deferred_directory_descriptors_preserve_empty_folders_and_content_indexes() {
+    struct Tree {
+        file: Arc<MockSource>,
+        loads: AtomicUsize,
+    }
+    impl gpui::VirtualFileTreeProvider for Tree {
+        fn load(&self) -> io::Result<VirtualFileDragPayload> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let mut root = descriptor("folder", self.file.clone());
+            root.is_directory = true;
+            root.size = None;
+            let mut empty = descriptor("folder\\empty", self.file.clone());
+            empty.is_directory = true;
+            empty.size = None;
+            VirtualFileDragPayload::new_tree([
+                root,
+                empty,
+                descriptor("folder\\data.txt", self.file.clone()),
+            ])
+        }
+        fn cancel(&self) {
+            self.file.cancel();
+        }
+    }
+    let lifetime = Arc::new(());
+    let tree = Arc::new(Tree {
+        file: source(b"nested".to_vec(), false),
+        loads: AtomicUsize::new(0),
+    });
+    let data = data(session(
+        ExternalDragPayload::VirtualFileTree(gpui::DeferredVirtualFileDragPayload::new(
+            tree.clone(),
+        )),
+        &lifetime,
+    ));
+    assert_eq!(tree.loads.load(Ordering::SeqCst), 0);
+    let descriptor_format = unsafe { RegisterClipboardFormatW(w!("FileGroupDescriptorW")) } as u16;
+    let content_format = unsafe { RegisterClipboardFormatW(w!("FileContents")) } as u16;
+    let mut medium = unsafe {
+        data.GetData(&format(descriptor_format, TYMED_HGLOBAL, -1))
+            .unwrap()
+    };
+    unsafe {
+        use windows::Win32::{
+            Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY,
+            System::Memory::{GlobalLock, GlobalUnlock},
+            UI::Shell::FILEDESCRIPTORW,
+        };
+        let pointer = GlobalLock(medium.u.hGlobal) as *const u8;
+        assert_eq!(std::ptr::read_unaligned(pointer.cast::<u32>()), 3);
+        let root = std::ptr::read_unaligned(pointer.add(4).cast::<FILEDESCRIPTORW>());
+        let empty = std::ptr::read_unaligned(
+            pointer
+                .add(4 + std::mem::size_of::<FILEDESCRIPTORW>())
+                .cast::<FILEDESCRIPTORW>(),
+        );
+        assert_ne!(root.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0, 0);
+        assert_ne!(empty.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0, 0);
+        GlobalUnlock(medium.u.hGlobal).ok();
+        ReleaseStgMedium(&mut medium);
+        assert_eq!(
+            data.QueryGetData(&format(content_format, TYMED_ISTREAM, 0)),
+            DV_E_LINDEX
+        );
+        assert_eq!(
+            data.QueryGetData(&format(content_format, TYMED_ISTREAM, 1)),
+            DV_E_LINDEX
+        );
+    }
+    assert_eq!(tree.loads.load(Ordering::SeqCst), 1);
+    assert_eq!(tree.file.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(read(&content(&data, 2), 100).1, b"nested");
+    assert_eq!(tree.loads.load(Ordering::SeqCst), 1);
 }
