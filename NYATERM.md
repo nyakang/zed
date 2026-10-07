@@ -289,5 +289,18 @@ virtual payloads, with a pause query for native idle accounting. Existing payloa
 constructors and local URI sources retain their behavior. The contract describes
 content provided to a consumer, not final filesystem persistence.
 
-Validation: rustfmt and Windows consumer compilation; native Windows lifecycle
-tests are recorded with the platform patch. Finder manual tests remain pending.
+Validation: rustfmt and Windows consumer compilation passed in the subsequent
+platform patch tests. Finder manual tests remain pending.
+
+
+## 2026-10-07 Windows delivery completion and idle accounting
+
+Emit typed lifecycle notifications once at async EndOperation or synchronous
+consumer release. Preserve read failures, report drop acceptance separately, and
+exclude active reads, deferred enumeration and user pauses from idle expiry.
+Window destruction and explicit cancellation still wake providers.
+
+Validation on Windows: `cargo test -p gpui_windows --features test-support
+external_drag --lib` (13 passed). This includes seeks/clones, empty files/trees,
+cancellation, one-shot completion and pause/active-operation idle accounting.
+Explorer interactive multi-selection and final output hashes remain pending.

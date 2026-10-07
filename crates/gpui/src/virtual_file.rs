@@ -17,18 +17,26 @@ pub const VIRTUAL_FILE_CHUNK_SIZE: usize = 64 * 1024;
 /// Native drag status describes delivery to the consumer, not final disk persistence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeFileDragEvent {
+    /// The native gesture has started.
     Started,
+    /// A consumer accepted the drop.
     Dropped,
+    /// Terminal delivery status, emitted once per gesture.
     Finished(NativeFileDragOutcome),
 }
 
+/// Final native consumer status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeFileDragOutcome {
+    /// The consumer released or completed its content operation.
     Provided,
+    /// The source or consumer cancelled.
     Cancelled,
+    /// Native delivery or a source read failed.
     Failed,
 }
 
+/// Optional worker-safe observer shared by flat and deferred virtual payloads.
 pub trait NativeFileDragObserver: Send + Sync + 'static {
     /// May run on a native worker; must not block or access UI entities.
     fn observe(&self, event: NativeFileDragEvent);
@@ -115,10 +123,12 @@ impl Eq for VirtualFileDescriptor {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VirtualFileDragPayload(SmallVec<[VirtualFileDescriptor; 2]>, DragObserver);
 impl VirtualFileDragPayload {
+    /// Attach a gesture observer without resolving or opening any sources.
     pub fn with_observer(mut self, observer: Arc<dyn NativeFileDragObserver>) -> Self {
         self.1 = DragObserver(Some(observer));
         self
     }
+    /// The observer associated with this gesture.
     pub fn observer(&self) -> Option<&Arc<dyn NativeFileDragObserver>> {
         self.1.0.as_ref()
     }
@@ -239,10 +249,12 @@ impl PartialEq for DeferredVirtualFileDragPayload {
 }
 impl Eq for DeferredVirtualFileDragPayload {}
 impl DeferredVirtualFileDragPayload {
+    /// Attach a gesture observer without resolving or opening any sources.
     pub fn with_observer(mut self, observer: Arc<dyn NativeFileDragObserver>) -> Self {
         self.1 = DragObserver(Some(observer));
         self
     }
+    /// The observer associated with this gesture.
     pub fn observer(&self) -> Option<&Arc<dyn NativeFileDragObserver>> {
         self.1.0.as_ref()
     }

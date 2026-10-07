@@ -101,6 +101,10 @@ fn session(payload: ExternalDragPayload, lifetime: &Arc<()>) -> Arc<DragExportSe
         started: Instant::now(),
         activity_ms: AtomicU64::new(0),
         source_validation: 7,
+        finished: AtomicBool::new(false),
+        dropped: AtomicBool::new(false),
+        failed: AtomicBool::new(false),
+        active: AtomicUsize::new(0),
     })
 }
 fn data(session: Arc<DragExportSession>) -> IDataObject {
@@ -443,4 +447,66 @@ fn deferred_directory_descriptors_preserve_empty_folders_and_content_indexes() {
     assert_eq!(tree.file.opens.load(Ordering::SeqCst), 0);
     assert_eq!(read(&content(&data, 2), 100).1, b"nested");
     assert_eq!(tree.loads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn native_completion_is_reported_once_even_when_cancel_and_release_follow() {
+    struct Observer(std::sync::Mutex<Vec<gpui::NativeFileDragEvent>>);
+    impl gpui::NativeFileDragObserver for Observer {
+        fn observe(&self, event: gpui::NativeFileDragEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let observer = Arc::new(Observer(std::sync::Mutex::new(Vec::new())));
+    let lifetime = Arc::new(());
+    let payload =
+        VirtualFileDragPayload::new([descriptor("file", source(b"file".to_vec(), false))])
+            .unwrap()
+            .with_observer(observer.clone());
+    let session = session(ExternalDragPayload::VirtualFiles(payload), &lifetime);
+    session.finish(gpui::NativeFileDragOutcome::Provided);
+    session.finish(gpui::NativeFileDragOutcome::Failed);
+    session.cancel();
+    drop(session);
+    assert_eq!(
+        *observer.0.lock().unwrap(),
+        [gpui::NativeFileDragEvent::Finished(
+            gpui::NativeFileDragOutcome::Provided
+        )]
+    );
+}
+
+#[test]
+fn native_idle_expiry_excludes_active_operations_and_user_pauses() {
+    struct Paused;
+    impl gpui::NativeFileDragObserver for Paused {
+        fn observe(&self, _: gpui::NativeFileDragEvent) {}
+        fn is_paused(&self) -> bool {
+            true
+        }
+    }
+    let lifetime = Arc::new(());
+    let mut session = session(
+        ExternalDragPayload::VirtualFiles(
+            VirtualFileDragPayload::new([descriptor("file", source(vec![], false))]).unwrap(),
+        ),
+        &lifetime,
+    );
+    Arc::get_mut(&mut session).unwrap().started =
+        Instant::now() - std::time::Duration::from_secs(600);
+    assert!(session.idle_expired());
+    {
+        let _operation = session.operation();
+        assert!(!session.idle_expired());
+    }
+    assert!(!session.idle_expired());
+    Arc::get_mut(&mut session)
+        .unwrap()
+        .activity_ms
+        .store(0, Ordering::Release);
+    let payload = VirtualFileDragPayload::new([descriptor("file", source(vec![], false))])
+        .unwrap()
+        .with_observer(Arc::new(Paused));
+    Arc::get_mut(&mut session).unwrap().payload = ExternalDragPayload::VirtualFiles(payload);
+    assert!(!session.idle_expired());
 }

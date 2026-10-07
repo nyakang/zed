@@ -70,3 +70,7 @@ jobs:
       - name: Native file promise delegate test
         if: runner.os == 'macOS'
         run: cargo test -p gpui_macos file_promise --lib
+
+      - name: Native Windows drag tests
+        if: runner.os == 'Windows'
+        run: cargo test -p gpui_windows --features test-support external_drag --lib

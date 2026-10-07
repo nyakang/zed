@@ -2,7 +2,8 @@
 //! wait for bounded provider requests without ever waiting on GPUI's UI thread.
 
 use gpui::{
-    ExternalDragPayload, VIRTUAL_FILE_CHUNK_SIZE, VirtualFileDescriptor, VirtualFileStream,
+    ExternalDragPayload, NativeFileDragEvent, NativeFileDragObserver, NativeFileDragOutcome,
+    VIRTUAL_FILE_CHUNK_SIZE, VirtualFileDescriptor, VirtualFileStream,
 };
 use gpui_util::ResultExt as _;
 use std::{
@@ -12,7 +13,7 @@ use std::{
     os::windows::ffi::OsStrExt,
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Instant, UNIX_EPOCH},
 };
@@ -70,11 +71,49 @@ pub(crate) struct DragExportSession {
     pub(crate) started: Instant,
     pub(crate) activity_ms: AtomicU64,
     pub(crate) source_validation: usize,
+    pub(crate) finished: AtomicBool,
+    pub(crate) dropped: AtomicBool,
+    pub(crate) failed: AtomicBool,
+    pub(crate) active: AtomicUsize,
 }
 
 impl DragExportSession {
+    fn observer(&self) -> Option<&Arc<dyn NativeFileDragObserver>> {
+        match &self.payload {
+            ExternalDragPayload::VirtualFiles(files) => files.observer(),
+            ExternalDragPayload::VirtualFileTree(tree) => tree.observer(),
+            _ => None,
+        }
+    }
+    fn observe(&self, event: NativeFileDragEvent) {
+        if let Some(observer) = self.observer() {
+            observer.observe(event);
+        }
+    }
+    pub(crate) fn finish(&self, outcome: NativeFileDragOutcome) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            self.observe(NativeFileDragEvent::Finished(outcome));
+        }
+    }
+    pub(crate) fn idle_expired(&self) -> bool {
+        if self.active.load(Ordering::Acquire) > 0
+            || self.observer().is_some_and(|observer| observer.is_paused())
+        {
+            self.touch();
+            return false;
+        }
+        (self.started.elapsed().as_millis() as u64)
+            .saturating_sub(self.activity_ms.load(Ordering::Relaxed))
+            > 300_000
+    }
+    pub(crate) fn operation(&self) -> DragOperation<'_> {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.touch();
+        DragOperation(self)
+    }
     pub(crate) fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.finish(NativeFileDragOutcome::Cancelled);
             match &self.payload {
                 ExternalDragPayload::VirtualFiles(files) => files.cancel(),
                 ExternalDragPayload::VirtualFileTree(tree) => tree.cancel(),
@@ -83,6 +122,7 @@ impl DragExportSession {
         }
     }
     fn payload(&self) -> Result<&ExternalDragPayload> {
+        let _operation = self.operation();
         if let ExternalDragPayload::VirtualFileTree(tree) = &self.payload {
             match self.resolved_payload.get_or_init(|| {
                 tree.resolve()
@@ -108,8 +148,23 @@ impl DragExportSession {
     }
 }
 
+pub(crate) struct DragOperation<'a>(&'a DragExportSession);
+impl Drop for DragOperation<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Drop for DragExportSession {
     fn drop(&mut self) {
+        self.finish(if self.failed.load(Ordering::Acquire) {
+            NativeFileDragOutcome::Failed
+        } else if self.dropped.load(Ordering::Acquire) {
+            NativeFileDragOutcome::Provided
+        } else {
+            NativeFileDragOutcome::Cancelled
+        });
         self.cancel();
     }
 }
@@ -150,7 +205,12 @@ pub(crate) fn start(
                 started: Instant::now(),
                 activity_ms: AtomicU64::new(0),
                 source_validation,
+                finished: AtomicBool::new(false),
+                dropped: AtomicBool::new(false),
+                failed: AtomicBool::new(false),
+                active: AtomicUsize::new(0),
             });
+            session.observe(NativeFileDragEvent::Started);
             unsafe {
                 if OleInitialize(None).is_err() {
                     session.cancel();
@@ -192,9 +252,7 @@ pub(crate) fn start(
                             let Some(session) = watch_session.upgrade() else {
                                 break;
                             };
-                            let idle = session.started.elapsed().as_millis() as u64
-                                - session.activity_ms.load(Ordering::Relaxed);
-                            if session.is_cancelled() || idle > 300_000 {
+                            if session.is_cancelled() || session.idle_expired() {
                                 session.cancel();
                                 break;
                             }
@@ -246,6 +304,9 @@ pub(crate) fn start(
                 .log_err();
                 if result != DRAGDROP_S_DROP || effect == DROPEFFECT_NONE {
                     session.cancel();
+                } else {
+                    session.dropped.store(true, Ordering::Release);
+                    session.observe(NativeFileDragEvent::Dropped);
                 }
                 drop(source);
                 drop(data);
@@ -253,9 +314,7 @@ pub(crate) fn start(
                 // apartment pumping until their final Release. A stalled/leaking target
                 // is cancelled after five idle minutes; active large copies have no limit.
                 while Arc::strong_count(&session) > 1 && !session.is_cancelled() {
-                    let idle = session.started.elapsed().as_millis() as u64
-                        - session.activity_ms.load(Ordering::Relaxed);
-                    if idle > 300_000 {
+                    if session.idle_expired() {
                         session.cancel();
                         break;
                     }
@@ -270,6 +329,13 @@ pub(crate) fn start(
                 if watcher.join().is_err() {
                     log::warn!("native drag cancellation watcher panicked");
                 }
+                session.finish(if session.failed.load(Ordering::Acquire) {
+                    NativeFileDragOutcome::Failed
+                } else if session.is_cancelled() {
+                    NativeFileDragOutcome::Cancelled
+                } else {
+                    NativeFileDragOutcome::Provided
+                });
                 OleUninitialize();
             }
         })
@@ -579,7 +645,15 @@ impl IDataObjectAsyncCapability_Impl for DragDataObject_Impl {
         self.in_operation.set(false);
         self.session.touch();
         if result.is_err() {
+            self.session.finish(NativeFileDragOutcome::Failed);
             self.session.cancel();
+        } else {
+            self.session
+                .finish(if self.session.failed.load(Ordering::Acquire) {
+                    NativeFileDragOutcome::Failed
+                } else {
+                    NativeFileDragOutcome::Provided
+                });
         }
         Ok(())
     }
@@ -641,6 +715,7 @@ impl Drop for ContentStream {
 
 impl ISequentialStream_Impl for ContentStream_Impl {
     fn Read(&self, output: *mut c_void, length: u32, read: *mut u32) -> HRESULT {
+        let _operation = self.session.operation();
         if !read.is_null() {
             unsafe {
                 *read = 0;
@@ -664,7 +739,10 @@ impl ISequentialStream_Impl for ContentStream_Impl {
         if handle.is_none() {
             match self.descriptor.provider.open() {
                 Ok(stream) => *handle = Some(stream),
-                Err(_) => return STG_E_READFAULT,
+                Err(_) => {
+                    self.session.failed.store(true, Ordering::Release);
+                    return STG_E_READFAULT;
+                }
             }
         }
         let Some(stream) = handle.as_mut() else {
@@ -696,6 +774,7 @@ impl ISequentialStream_Impl for ContentStream_Impl {
                     n
                 }
                 _ => {
+                    self.session.failed.store(true, Ordering::Release);
                     stream.cancel();
                     return STG_E_READFAULT;
                 }
@@ -706,6 +785,7 @@ impl ISequentialStream_Impl for ContentStream_Impl {
                     .size
                     .is_some_and(|size| self.offset.get() < size)
                 {
+                    self.session.failed.store(true, Ordering::Release);
                     stream.cancel();
                     return STG_E_READFAULT;
                 }
