@@ -10,6 +10,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
+    sync::OnceLock,
 };
 
 struct PromiseIvars {
@@ -83,8 +84,16 @@ pub(crate) fn provider(file: PromisedFileDescriptor) -> Retained<NSFilePromisePr
     } else {
         "public.data"
     });
-    let queue = NSOperationQueue::new();
-    queue.setMaxConcurrentOperationCount(1);
+    // One queue for the entire application bounds simultaneous blocking writes,
+    // even when several windows each advertise many promises.
+    static QUEUE: OnceLock<Retained<NSOperationQueue>> = OnceLock::new();
+    let queue = QUEUE
+        .get_or_init(|| {
+            let queue = NSOperationQueue::new();
+            queue.setMaxConcurrentOperationCount(3);
+            queue
+        })
+        .clone();
     let delegate = FilePromiseDelegate::alloc().set_ivars(PromiseIvars { file, queue });
     let delegate: Retained<FilePromiseDelegate> = unsafe { msg_send![super(delegate), init] };
     let provider = NSFilePromiseProvider::initWithFileType_delegate(
@@ -171,7 +180,7 @@ mod tests {
                     let queue: Retained<NSOperationQueue> = unsafe {
                         msg_send![&*delegate, operationQueueForFilePromiseProvider: &*promise]
                     };
-                    assert_eq!(queue.maxConcurrentOperationCount(), 1);
+                    assert_eq!(queue.maxConcurrentOperationCount(), 3);
                     assert!(!source.cancelled.load(Ordering::Acquire));
                     let url = NSURL::fileURLWithPath(&NSString::from_str("/tmp/GPUI promise/你好"));
                     let calls = AtomicUsize::new(0);

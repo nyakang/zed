@@ -304,3 +304,15 @@ Validation on Windows: `cargo test -p gpui_windows --features test-support
 external_drag --lib` (13 passed). This includes seeks/clones, empty files/trees,
 cancellation, one-shot completion and pause/active-operation idle accounting.
 Explorer interactive multi-selection and final output hashes remain pending.
+
+
+## 2026-10-07 shared macOS promise queue
+
+All NSFilePromiseProvider delegates now return the same application-wide
+NSOperationQueue with at most three concurrent operations, instead of allocating
+one blocking queue per item. The existing completion callback still executes
+exactly once per native request. The delegate dispatch test checks the new limit;
+macOS CI compiles and executes it. Local URL dragging is unchanged.
+
+Validation: rustfmt on Windows. macOS native compilation/test results must be
+confirmed by branch CI; interactive Finder directory recovery remains pending.
