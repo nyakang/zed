@@ -14,6 +14,51 @@ use std::{
 /// Maximum content request; adapters split larger reads into bounded chunks.
 pub const VIRTUAL_FILE_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Native drag status describes delivery to the consumer, not final disk persistence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeFileDragEvent {
+    Started,
+    Dropped,
+    Finished(NativeFileDragOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeFileDragOutcome {
+    Provided,
+    Cancelled,
+    Failed,
+}
+
+pub trait NativeFileDragObserver: Send + Sync + 'static {
+    /// May run on a native worker; must not block or access UI entities.
+    fn observe(&self, event: NativeFileDragEvent);
+    /// User pauses are excluded from native idle expiry.
+    fn is_paused(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Default)]
+struct DragObserver(Option<Arc<dyn NativeFileDragObserver>>);
+impl fmt::Debug for DragObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("DragObserver")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+impl PartialEq for DragObserver {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for DragObserver {}
+
 /// A reusable deferred source, independent of the application's transport.
 pub trait VirtualFileProvider: Send + Sync + 'static {
     /// Create an independent stream without blocking IO. Platform workers request content.
@@ -68,8 +113,15 @@ impl Eq for VirtualFileDescriptor {}
 
 /// Regular virtual files in content-index order. Native destinations handle conflicts.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VirtualFileDragPayload(SmallVec<[VirtualFileDescriptor; 2]>);
+pub struct VirtualFileDragPayload(SmallVec<[VirtualFileDescriptor; 2]>, DragObserver);
 impl VirtualFileDragPayload {
+    pub fn with_observer(mut self, observer: Arc<dyn NativeFileDragObserver>) -> Self {
+        self.1 = DragObserver(Some(observer));
+        self
+    }
+    pub fn observer(&self) -> Option<&Arc<dyn NativeFileDragObserver>> {
+        self.1.0.as_ref()
+    }
     /// Validate every filename before advertising the payload.
     pub fn new(files: impl IntoIterator<Item = VirtualFileDescriptor>) -> io::Result<Self> {
         Self::validate(files, false)
@@ -145,7 +197,7 @@ impl VirtualFileDragPayload {
                 directories.insert(full_name.to_lowercase());
             }
         }
-        Ok(Self(files))
+        Ok(Self(files, DragObserver::default()))
     }
     /// Descriptors in native content-index order.
     pub fn files(&self) -> &[VirtualFileDescriptor] {
@@ -173,7 +225,7 @@ struct DeferredTree {
 }
 /// Lazily frozen native descriptor tree. Resolution errors are cached as well.
 #[derive(Clone)]
-pub struct DeferredVirtualFileDragPayload(Arc<DeferredTree>);
+pub struct DeferredVirtualFileDragPayload(Arc<DeferredTree>, DragObserver);
 impl fmt::Debug for DeferredVirtualFileDragPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredVirtualFileDragPayload")
@@ -182,18 +234,28 @@ impl fmt::Debug for DeferredVirtualFileDragPayload {
 }
 impl PartialEq for DeferredVirtualFileDragPayload {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && self.1 == other.1
     }
 }
 impl Eq for DeferredVirtualFileDragPayload {}
 impl DeferredVirtualFileDragPayload {
+    pub fn with_observer(mut self, observer: Arc<dyn NativeFileDragObserver>) -> Self {
+        self.1 = DragObserver(Some(observer));
+        self
+    }
+    pub fn observer(&self) -> Option<&Arc<dyn NativeFileDragObserver>> {
+        self.1.0.as_ref()
+    }
     /// Wrap a source without enumerating it or opening any content.
     pub fn new(source: Arc<dyn VirtualFileTreeProvider>) -> Self {
-        Self(Arc::new(DeferredTree {
-            source,
-            result: OnceLock::new(),
-            cancelled: AtomicBool::new(false),
-        }))
+        Self(
+            Arc::new(DeferredTree {
+                source,
+                result: OnceLock::new(),
+                cancelled: AtomicBool::new(false),
+            }),
+            DragObserver::default(),
+        )
     }
     /// May block; native workers only. The validated result is frozen for all indexes.
     pub fn resolve(&self) -> io::Result<&VirtualFileDragPayload> {

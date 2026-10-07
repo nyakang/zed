@@ -280,3 +280,14 @@ names, operation queue ownership, exact destination URL propagation and one-shot
 success/error completion. Its provider records destinations without writing files
 or requiring Finder; branch CI runs this native ABI regression. Interactive Finder
 and Linux file-manager gestures remain a distinct manual verification step.
+
+
+## 2026-10-07 native drag lifecycle contract
+
+Add optional typed Started/Dropped/Finished observers for flat and deferred
+virtual payloads, with a pause query for native idle accounting. Existing payload
+constructors and local URI sources retain their behavior. The contract describes
+content provided to a consumer, not final filesystem persistence.
+
+Validation: rustfmt and Windows consumer compilation; native Windows lifecycle
+tests are recorded with the platform patch. Finder manual tests remain pending.
