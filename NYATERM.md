@@ -262,3 +262,11 @@ Objective-C return values. Correct both signatures and mark NSError construction
 unsafe with its fixed-domain, no-userInfo contract. Windows formatting passes;
 macOS compilation is rerun in branch CI. This is an ABI correction, not a change
 to the promise destination or application data contracts.
+
+
+## 2026-10-07 Xdnd completion ownership
+
+Associate the foreground completion callback with its original cancellation
+handle so an old receiver completion cannot clear a newer gesture or its window
+cancellation. The preceding Linux branch CI compiled gpui_linux successfully;
+this guard is formatted locally and the final revision is rechecked by CI.

@@ -1420,6 +1420,7 @@ impl PlatformWindow for X11Window {
             return false;
         }
         let source = self.0.x_window;
+        let completion_cancelled = cancelled.clone();
         let (sender, receiver) = futures::channel::oneshot::channel();
         if std::thread::Builder::new()
             .name("x11-file-drag".into())
@@ -1442,6 +1443,15 @@ impl PlatformWindow for X11Window {
                 match receiver.await {
                     Ok(Ok(())) => {}
                     _ => log::warn!("native X11 file drag failed"),
+                }
+                if !this
+                    .state
+                    .borrow()
+                    .external_drag_cancel
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &completion_cancelled))
+                {
+                    return;
                 }
                 this.state.borrow_mut().external_drag_cancel.take();
                 this.handle_input(gpui::PlatformInput::FileDrop(
