@@ -66,3 +66,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check
         run: cargo check ${{ matrix.args }}
+
+      - name: Native file promise delegate test
+        if: runner.os == 'macOS'
+        run: cargo test -p gpui_macos file_promise --lib

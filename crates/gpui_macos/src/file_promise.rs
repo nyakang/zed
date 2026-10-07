@@ -99,3 +99,98 @@ pub(crate) fn provider(file: PromisedFileDescriptor) -> Retained<NSFilePromisePr
     }
     provider
 }
+
+#[cfg(test)]
+mod tests {
+    use super::provider;
+    use block2::RcBlock;
+    use gpui::{PromisedFileDescriptor, PromisedFileProvider};
+    use objc2::{
+        msg_send,
+        rc::{Retained, autoreleasepool},
+    };
+    use objc2_app_kit::NSFilePromiseProvider;
+    use objc2_foundation::{NSError, NSOperationQueue, NSString, NSURL};
+    use std::{
+        io,
+        path::{Path, PathBuf},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    struct Source {
+        received: Mutex<Vec<PathBuf>>,
+        cancelled: AtomicBool,
+        fail: bool,
+    }
+    impl PromisedFileProvider for Source {
+        fn write_to(&self, target: &Path) -> io::Result<()> {
+            self.received
+                .lock()
+                .expect("received paths")
+                .push(target.to_path_buf());
+            if self.fail {
+                Err(io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+    #[test]
+    fn native_promise_delegate_retains_source_and_delivers_exact_destination_once() {
+        for directory in [false, true] {
+            for fail in [false, true] {
+                let source = Arc::new(Source {
+                    received: Mutex::new(Vec::new()),
+                    cancelled: AtomicBool::new(false),
+                    fail,
+                });
+                autoreleasepool(|_| {
+                    let promise = provider(PromisedFileDescriptor {
+                        name: "你好".into(),
+                        is_directory: directory,
+                        provider: source.clone(),
+                    });
+                    let delegate = promise.delegate().expect("retained promise delegate");
+                    // These Objective-C dispatches exercise the runtime ABI, including
+                    // autoreleased object returns; no Finder or file writes are needed.
+                    let file_type = NSString::from_str(if directory {
+                        "public.folder"
+                    } else {
+                        "public.data"
+                    });
+                    let name: Retained<NSString> = unsafe {
+                        msg_send![&*delegate, filePromiseProvider: &*promise fileNameForType: &*file_type]
+                    };
+                    assert_eq!(name.to_string(), "你好");
+                    let queue: Retained<NSOperationQueue> = unsafe {
+                        msg_send![&*delegate, operationQueueForFilePromiseProvider: &*promise]
+                    };
+                    assert_eq!(queue.maxConcurrentOperationCount(), 1);
+                    assert!(!source.cancelled.load(Ordering::Acquire));
+                    let url = NSURL::fileURLWithPath(&NSString::from_str("/tmp/GPUI promise/你好"));
+                    let calls = AtomicUsize::new(0);
+                    let completion = RcBlock::new(|error: *mut NSError| {
+                        assert_eq!(!error.is_null(), fail);
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    });
+                    let _: () = unsafe {
+                        msg_send![&*delegate, filePromiseProvider: &*promise writePromiseToURL: &*url completionHandler: &*completion]
+                    };
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        *source.received.lock().expect("received paths"),
+                        [PathBuf::from("/tmp/GPUI promise/你好")]
+                    );
+                    let _: &NSFilePromiseProvider = &promise;
+                });
+                assert!(source.cancelled.load(Ordering::Acquire));
+            }
+        }
+    }
+}

@@ -270,3 +270,13 @@ Associate the foreground completion callback with its original cancellation
 handle so an old receiver completion cannot clear a newer gesture or its window
 cancellation. The preceding Linux branch CI compiled gpui_linux successfully;
 this guard is formatted locally and the final revision is rechecked by CI.
+
+
+## 2026-10-07 native promise dispatch regression
+
+macOS, Linux and Windows branch checks passed for the corrected delegate revision.
+Add a macOS-only Objective-C dispatch test for source retention, file/directory
+names, operation queue ownership, exact destination URL propagation and one-shot
+success/error completion. Its provider records destinations without writing files
+or requiring Finder; branch CI runs this native ABI regression. Interactive Finder
+and Linux file-manager gestures remain a distinct manual verification step.
