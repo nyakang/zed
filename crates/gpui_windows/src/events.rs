@@ -29,7 +29,6 @@ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
-pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
 pub(crate) const WM_GPUI_NATIVE_DRAG_ENDED: u32 = WM_USER + 11;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
