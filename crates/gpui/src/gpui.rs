@@ -218,9 +218,9 @@ pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use virtual_file::{
-    NativeFileDragEvent, NativeFileDragObserver, NativeFileDragOutcome,
-    DeferredVirtualFileDragPayload, VIRTUAL_FILE_CHUNK_SIZE, VirtualFileDescriptor,
-    VirtualFileDragPayload, VirtualFileProvider, VirtualFileStream, VirtualFileTreeProvider,
+    DeferredVirtualFileDragPayload, NativeFileDragEvent, NativeFileDragObserver,
+    NativeFileDragOutcome, VIRTUAL_FILE_CHUNK_SIZE, VirtualFileDescriptor, VirtualFileDragPayload,
+    VirtualFileProvider, VirtualFileStream, VirtualFileTreeProvider,
 };
 pub use window::*;
 
