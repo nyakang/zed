@@ -1,5 +1,20 @@
 # NyaTerm fork notes
 
+## 2026-10-29 Windows IME composition caret notifications
+
+Windows IMEs may send `WM_IME_COMPOSITION` with `GCS_CURSORPOS` alone when
+moving within uncommitted text. GPUI previously forwarded preedit only when
+`GCS_COMPSTR` was also present, leaving terminal caret and candidate geometry
+stale. Dispatch now reads the current composition for either flag and forwards
+one text/selection update, retaining the existing cursor compatibility policy,
+result ordering, and cancellation behavior. No public interface changes.
+
+Validation on Windows: `cargo test -p gpui_windows --features test-support
+--lib ime_composition_tests --target-dir E:/Projects/Rust/nyaterm/target`
+passed all 4 tests. The tests cover cursor-only, combined/text-only, commit,
+combined result/preedit ordering, cancellation, and unrelated notifications.
+Interactive input-method testing is tracked by the consuming application.
+
 ## 2026-10-14 safe Windows internal drag targets
 
 Internal drag routing previously read the HWND under the pointer's

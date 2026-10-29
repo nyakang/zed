@@ -993,49 +993,33 @@ impl WindowsWindowInner {
     }
 
     fn handle_ime_composition_inner(&self, ctx: HIMC, lparam: LPARAM) -> Option<isize> {
-        let lparam = lparam.0 as u32;
-        if lparam == 0 {
-            // Japanese IME may send this message with lparam = 0, which indicates that
-            // there is no composition string.
-            self.with_input_handler(|input_handler| {
-                input_handler.replace_text_in_range(None, "");
-            })?;
-            Some(0)
-        } else {
-            if lparam & GCS_RESULTSTR.0 > 0 {
-                let comp_result = parse_ime_composition_string(ctx, GCS_RESULTSTR)?;
+        dispatch_ime_composition(
+            lparam.0 as u32,
+            |kind| parse_ime_composition_string(ctx, kind),
+            |text| {
+                let cursor_pos = retrieve_composition_cursor_position(ctx);
+                let position = if should_use_ime_cursor_position(ctx, cursor_pos) {
+                    cursor_pos.min(text.len())
+                } else {
+                    text.len()
+                };
+                position..position
+            },
+            |text| {
                 self.with_input_handler(|input_handler| {
-                    input_handler
-                        .replace_text_in_range(None, &String::from_utf16_lossy(&comp_result));
-                })?;
-            }
-            if lparam & GCS_COMPSTR.0 > 0 {
-                let comp_string = parse_ime_composition_string(ctx, GCS_COMPSTR)?;
-                let caret_pos =
-                    (!comp_string.is_empty() && lparam & GCS_CURSORPOS.0 > 0).then(|| {
-                        let cursor_pos = retrieve_composition_cursor_position(ctx);
-                        let pos = if should_use_ime_cursor_position(ctx, cursor_pos) {
-                            cursor_pos
-                        } else {
-                            comp_string.len()
-                        };
-                        pos..pos
-                    });
+                    input_handler.replace_text_in_range(None, &String::from_utf16_lossy(text));
+                })
+            },
+            |text, selected| {
                 self.with_input_handler(|input_handler| {
                     input_handler.replace_and_mark_text_in_range(
                         None,
-                        &String::from_utf16_lossy(&comp_string),
-                        caret_pos,
+                        &String::from_utf16_lossy(text),
+                        selected,
                     );
-                })?;
-            }
-            if lparam & (GCS_RESULTSTR.0 | GCS_COMPSTR.0) > 0 {
-                return Some(0);
-            }
-
-            // currently, we don't care other stuff
-            None
-        }
+                })
+            },
+        )
     }
 
     fn handle_calc_client_size(
@@ -1984,6 +1968,32 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
     )
 }
 
+// Cursor-only notifications still describe the current composition. Forward the
+// text and selection together so controls can use the same update path, without
+// replaying a commit or dropping a caret movement when the text did not change.
+fn dispatch_ime_composition(
+    flags: u32,
+    mut read_text: impl FnMut(IME_COMPOSITION_STRING) -> Option<Vec<u16>>,
+    mut caret: impl FnMut(&[u16]) -> std::ops::Range<usize>,
+    mut commit: impl FnMut(&[u16]) -> Option<()>,
+    mut mark: impl FnMut(&[u16], Option<std::ops::Range<usize>>) -> Option<()>,
+) -> Option<isize> {
+    if flags == 0 {
+        // Japanese IMEs can cancel composition with a zero flag message.
+        commit(&[])?;
+        return Some(0);
+    }
+    if flags & GCS_RESULTSTR.0 > 0 {
+        commit(&read_text(GCS_RESULTSTR)?)?;
+    }
+    if flags & (GCS_COMPSTR.0 | GCS_CURSORPOS.0) > 0 {
+        let text = read_text(GCS_COMPSTR)?;
+        let selected = (!text.is_empty() && flags & GCS_CURSORPOS.0 > 0).then(|| caret(&text));
+        mark(&text, selected)?;
+    }
+    (flags & (GCS_RESULTSTR.0 | GCS_COMPSTR.0 | GCS_CURSORPOS.0) > 0).then_some(0)
+}
+
 fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) -> Option<Vec<u16>> {
     unsafe {
         let string_len = ImmGetCompositionStringW(ctx, comp_type, None, 0);
@@ -2244,5 +2254,96 @@ mod pointer_capture_tests {
                 .queue_cancel(PointerCancelReason::CaptureLost)
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod ime_composition_tests {
+    use super::dispatch_ime_composition;
+    use std::{cell::RefCell, ops::Range};
+    use windows::Win32::UI::Input::Ime::{GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR};
+
+    #[derive(Debug, PartialEq)]
+    enum Update {
+        Commit(String),
+        Mark(String, Option<Range<usize>>),
+    }
+
+    fn dispatch(flags: u32) -> (Option<isize>, Vec<Update>, Vec<u32>) {
+        let updates = RefCell::new(Vec::new());
+        let mut reads = Vec::new();
+        let result = dispatch_ime_composition(
+            flags,
+            |kind| {
+                reads.push(kind.0);
+                Some(
+                    if kind == GCS_RESULTSTR {
+                        "中"
+                    } else {
+                        "zhong"
+                    }
+                    .encode_utf16()
+                    .collect(),
+                )
+            },
+            |_| 2..2,
+            |text| {
+                updates
+                    .borrow_mut()
+                    .push(Update::Commit(String::from_utf16_lossy(text)));
+                Some(())
+            },
+            |text, selected| {
+                updates
+                    .borrow_mut()
+                    .push(Update::Mark(String::from_utf16_lossy(text), selected));
+                Some(())
+            },
+        );
+        (result, updates.into_inner(), reads)
+    }
+
+    #[test]
+    fn cursor_only_notification_updates_current_composition_without_committing() {
+        let (result, updates, reads) = dispatch(GCS_CURSORPOS.0);
+        assert_eq!(result, Some(0));
+        assert_eq!(reads, [GCS_COMPSTR.0]);
+        assert_eq!(updates, [Update::Mark("zhong".into(), Some(2..2))]);
+    }
+
+    #[test]
+    fn text_and_cursor_notification_marks_once_and_text_only_keeps_default_selection() {
+        let (_, updates, reads) = dispatch(GCS_COMPSTR.0 | GCS_CURSORPOS.0);
+        assert_eq!(reads, [GCS_COMPSTR.0]);
+        assert_eq!(updates, [Update::Mark("zhong".into(), Some(2..2))]);
+        let (_, updates, _) = dispatch(GCS_COMPSTR.0);
+        assert_eq!(updates, [Update::Mark("zhong".into(), None)]);
+    }
+
+    #[test]
+    fn result_and_cancel_preserve_commit_order_and_do_not_duplicate_text() {
+        let (_, updates, reads) = dispatch(GCS_RESULTSTR.0);
+        assert_eq!(reads, [GCS_RESULTSTR.0]);
+        assert_eq!(updates, [Update::Commit("中".into())]);
+        let (_, updates, reads) = dispatch(GCS_RESULTSTR.0 | GCS_COMPSTR.0 | GCS_CURSORPOS.0);
+        assert_eq!(reads, [GCS_RESULTSTR.0, GCS_COMPSTR.0]);
+        assert_eq!(
+            updates,
+            [
+                Update::Commit("中".into()),
+                Update::Mark("zhong".into(), Some(2..2))
+            ]
+        );
+        let (_, updates, reads) = dispatch(0);
+        assert!(reads.is_empty());
+        assert_eq!(updates, [Update::Commit(String::new())]);
+    }
+
+    #[test]
+    fn unsupported_notification_is_left_to_the_default_window_procedure() {
+        let (result, updates, reads) = dispatch(0x8000_0000);
+        assert_eq!(result, None);
+        assert!(updates.is_empty());
+        assert!(reads.is_empty());
     }
 }
