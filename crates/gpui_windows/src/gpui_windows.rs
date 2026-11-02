@@ -16,6 +16,7 @@ mod external_drag;
 mod external_drag_tests;
 mod keyboard;
 mod modal_owner;
+mod native_cursor;
 mod native_overlay;
 mod platform;
 mod system_notifications;

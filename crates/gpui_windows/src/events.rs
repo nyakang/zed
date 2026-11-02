@@ -340,7 +340,7 @@ impl WindowsWindowInner {
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
-            WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
+            WM_SETCURSOR => self.handle_set_cursor(handle, wparam, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
@@ -1463,13 +1463,23 @@ impl WindowsWindowInner {
         });
 
         if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+            crate::native_cursor::set_cursor_at_pointer(
+                self.get_raw_handle(),
+                self.state.current_cursor.get(),
+            );
         }
 
         Some(0)
     }
 
-    fn handle_set_cursor(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+    fn handle_set_cursor(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let target = HWND(wparam.0 as _);
+        if crate::native_cursor::native_child_owns_cursor(handle, target) {
+            // DefWindowProc asks the parent before applying a child's cursor.
+            // Returning FALSE without SetCursor keeps the native input path intact.
+            log::trace!(target: "gpui::native_cursor", "native WM_SETCURSOR owner={} source={} hit={}", handle.0 as usize, target.0 as usize, lparam.loword());
+            return Some(0);
+        }
         if unsafe { !IsWindowEnabled(handle).as_bool() }
             || matches!(
                 lparam.loword() as u32,
@@ -1490,9 +1500,7 @@ impl WindowsWindowInner {
         } else {
             None
         };
-        unsafe {
-            SetCursor(cursor);
-        };
+        crate::native_cursor::set_cursor(handle, target, cursor);
         Some(0)
     }
 
@@ -1724,9 +1732,10 @@ impl WindowsWindowInner {
     /// Clear the hidden flag and restore the cursor immediately
     fn restore_cursor_after_hide(&self) {
         if !self.state.cursor_visible.swap(true, Ordering::Relaxed) {
-            unsafe {
-                SetCursor(self.state.current_cursor.get());
-            }
+            crate::native_cursor::set_cursor_at_pointer(
+                self.get_raw_handle(),
+                self.state.current_cursor.get(),
+            );
         }
     }
 

@@ -995,7 +995,7 @@ impl Platform for WindowsPlatform {
                 continue;
             };
             if window.state.hovered.get() {
-                unsafe { SetCursor(None) };
+                crate::native_cursor::set_cursor_at_pointer(window.get_raw_handle(), None);
                 break;
             }
         }

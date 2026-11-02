@@ -1,5 +1,24 @@
 # NyaTerm fork notes
 
+## 2026-11-03 native child cursor ownership
+
+Preserve the target HWND from WM_SETCURSOR and return FALSE without setting
+GPUI's cursor for a native child or descendant. Asynchronous style changes and
+hide/restore paths also check WindowFromPoint before calling SetCursor, so a
+GPUI redraw cannot replace mstscax's independently managed pointer. Owned popup
+menus retain GPUI cursor handling, and non-client resize cursors retain their
+existing default processing. No native mouse input is synthesized or replayed.
+
+Optional `gpui::native_cursor=trace` diagnostics report only numeric HWNDs,
+focus/cursor handles, and hit-test values; they are off at normal log levels.
+
+Validation: Windows x64 `cargo test -p gpui_windows --lib --features test-support
+-j 2 -- --test-threads=1` passed 58 tests, zero failed, one ignored. The new real
+HWND regression checks nested children, owner windows, owned popups, and hidden
+cursors. Scoped rustfmt and git diff --check passed. The available desktop
+control services report a missing native pipe, so real RDP pointer appearance,
+clipboard interaction, and cross-DPI acceptance remain for the consumer.
+
 ## 2026-11-02 native child input thread observation
 
 Use a UI-thread low-level mouse hook, filtered to descendants of the registered
