@@ -66,6 +66,8 @@ pub struct WindowsWindowState {
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<DirectXRenderer>,
+    pub(crate) native_overlay: RefCell<Option<crate::native_overlay::NativeOverlayWindow>>,
+    native_overlay_failures: Cell<u8>,
     /// Set when the next `draw_window` call must be treated as a forced
     /// render. Used after a GPU device-lost recovery, where the next frame
     /// must both re-enable drawing (via `mark_drawable`) and bypass the GPUI
@@ -166,6 +168,8 @@ impl WindowsWindowState {
             .context("initializing Direct Manipulation")?;
 
         Ok(Self {
+            native_overlay: RefCell::new(None),
+            native_overlay_failures: Cell::new(0),
             origin: Cell::new(origin),
             logical_size: Cell::new(logical_size),
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
@@ -414,6 +418,7 @@ impl WindowsWindowInner {
 pub(crate) struct Callbacks {
     pub(crate) request_frame: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
     pub(crate) input: Cell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
+    pub(crate) native_child_mouse_down: Cell<Option<Box<dyn FnMut(MouseDownEvent)>>>,
     pub(crate) active_status_change: Cell<Option<Box<dyn FnMut(bool)>>>,
     pub(crate) visibility_change: Cell<Option<Box<dyn FnMut(WindowVisibility)>>>,
     pub(crate) hovered_status_change: Cell<Option<Box<dyn FnMut(bool)>>>,
@@ -1158,11 +1163,63 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        self.state
+        if let Some(overlay) = self.state.native_overlay.borrow().as_ref() {
+            overlay.sync();
+        }
+        let result = self
+            .state
             .renderer
             .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
-            .log_err();
+            .draw(scene, self.state.background_appearance.get());
+        if result.is_err() && self.state.native_overlay.borrow().is_some() {
+            self.state
+                .native_overlay_failures
+                .set(self.state.native_overlay_failures.get().saturating_add(1));
+        }
+        if result.is_ok() {
+            self.state.native_overlay_failures.set(0);
+        }
+        result.log_err();
+    }
+
+    fn set_native_child_surface_mode(&self, enabled: bool) -> Result<()> {
+        if enabled {
+            anyhow::ensure!(
+                self.state.native_overlay_failures.get() < 3,
+                "native overlay composition failed; native presentation is unavailable"
+            );
+            if self.state.native_overlay.borrow().is_some() {
+                return Ok(());
+            }
+            let overlay = crate::native_overlay::NativeOverlayWindow::new(self.hwnd)?;
+            let result = self
+                .state
+                .renderer
+                .borrow_mut()
+                .set_native_overlay(Some(overlay.hwnd()));
+            if let Err(error) = result {
+                let _ = self.state.renderer.borrow_mut().set_native_overlay(None);
+                return Err(error);
+            }
+            *self.state.native_overlay.borrow_mut() = Some(overlay);
+        } else {
+            self.state.renderer.borrow_mut().set_native_overlay(None)?;
+            self.state.native_overlay.borrow_mut().take();
+        }
+        Ok(())
+    }
+
+    fn set_native_overlay_regions(&self, regions: &[Bounds<Pixels>]) {
+        if let Some(overlay) = self.state.native_overlay.borrow().as_ref() {
+            overlay.set_regions(regions, self.state.scale_factor.get());
+        }
+    }
+
+    fn on_native_child_mouse_down(&self, callback: Box<dyn FnMut(MouseDownEvent)>) {
+        self.state
+            .callbacks
+            .native_child_mouse_down
+            .set(Some(callback));
     }
 
     #[cfg(any(test, feature = "test-support"))]

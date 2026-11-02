@@ -200,7 +200,43 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if matches!(
+            msg,
+            WM_MOVE | WM_SIZE | WM_WINDOWPOSCHANGED | WM_SHOWWINDOW | WM_ACTIVATE | WM_DPICHANGED
+        ) {
+            if let Ok(overlay) = self.state.native_overlay.try_borrow() {
+                if let Some(overlay) = overlay.as_ref() {
+                    overlay.sync();
+                }
+            }
+        }
         let handled = match msg {
+            crate::native_overlay::WM_NATIVE_CHILD_MOUSE_DOWN => {
+                if let Some(mut callback) = self.state.callbacks.native_child_mouse_down.take() {
+                    let button = match wparam.0 as u32 {
+                        WM_LBUTTONDOWN => MouseButton::Left,
+                        WM_RBUTTONDOWN => MouseButton::Right,
+                        WM_MBUTTONDOWN => MouseButton::Middle,
+                        _ => MouseButton::Navigate(NavigationDirection::Back),
+                    };
+                    callback(MouseDownEvent {
+                        button,
+                        position: logical_point(
+                            lparam.signed_loword() as f32,
+                            lparam.signed_hiword() as f32,
+                            self.state.scale_factor.get(),
+                        ),
+                        modifiers: current_modifiers(),
+                        click_count: 1,
+                        first_mouse: false,
+                    });
+                    self.state
+                        .callbacks
+                        .native_child_mouse_down
+                        .set(Some(callback));
+                }
+                Some(0)
+            }
             WM_GPUI_POINTER_CANCELLED => {
                 self.handle_pointer_cancelled_msg(wparam, lparam);
                 Some(0)

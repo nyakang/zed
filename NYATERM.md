@@ -1,5 +1,22 @@
 # NyaTerm fork notes
 
+## 2026-11-02 Windows owned overlay composition
+
+Present overlay primitives in a transparent, nonactivating popup owned by the
+GPUI window, with DirectComposition and the same D3D device, atlas and pipelines.
+Interactive regions use client coordinates; other pixels return HTTRANSPARENT.
+A per-thread mouse hook observes presses targeting native descendants before
+their original delivery, without global hooks or replay. Owner movement, DPI,
+visibility and minimization synchronize the popup. Device recovery retains its
+HWND and rebuilds composition resources; persistent presentation failures are
+reported through the native-surface capability check.
+
+Validation: Windows x64 NyaTerm workspace check and five GPUI native-overlay
+tests passed. The standalone ActiveX smoke reached strict system certificate
+verification; the server certificate was rejected. Real remote pixels, IME,
+cross-monitor behavior and repeated native HWND lifecycle acceptance have not
+been claimed and are deferred to the consuming application's hardware tests.
+
 ## 2026-11-02 native child overlay scopes
 
 Split a single window scene into owner and native overlay layers while retaining
