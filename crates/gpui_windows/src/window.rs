@@ -595,7 +595,7 @@ impl WindowsWindow {
 
             (dwexstyle, dwstyle)
         };
-        if !disable_direct_composition {
+        if !disable_direct_composition && !params.native_child_surfaces {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
 

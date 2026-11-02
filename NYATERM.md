@@ -1,5 +1,23 @@
 # NyaTerm fork notes
 
+## 2026-11-02 native child owner redirection
+
+The lower composition target alone did not expose ActiveX pixels in NyaTerm's
+real Windows session. Its owner also opted out of legacy HWND redirection with
+`WS_EX_NOREDIRECTIONBITMAP`. Windows rejects changing this flag after creation.
+
+Add `WindowOptions::native_child_surfaces` (default false, Windows only in
+effect), forward it through `WindowParams`, and retain owner redirection when
+requested. Entering native overlay mode on an unredirected owner now returns an
+actionable error instead of accepting an invisible child. NyaTerm opts in for
+its workspace and smoke windows; normal GPUI windows keep their existing style.
+
+Validation: Windows x64 `cargo test -p gpui_windows --lib --features test-support
+--locked -j 1 -- --test-threads=1` passed 56 tests, with one ignored. This includes
+the real HWND rejection and redirected-owner lifecycle regressions. Serialized
+execution avoids contention in the existing OS clipboard test. Real RDP pixels
+and interaction are verified separately by the consuming application.
+
 ## 2026-11-02 native child composition order
 
 NyaTerm's ActiveX control reported Connected and LoginComplete, with a visible

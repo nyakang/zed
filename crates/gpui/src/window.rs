@@ -1608,6 +1608,8 @@ impl Window {
         cx: &mut App,
     ) -> Result<Self> {
         let WindowOptions {
+            #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+            native_child_surfaces,
             window_bounds,
             titlebar,
             focus,
@@ -1642,6 +1644,8 @@ impl Window {
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
+                #[cfg(target_os = "windows")]
+                native_child_surfaces,
                 bounds: window_bounds.get_bounds(),
                 titlebar,
                 kind,

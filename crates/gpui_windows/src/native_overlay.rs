@@ -41,6 +41,13 @@ pub(crate) struct NativeOverlayWindow {
 
 impl NativeOverlayWindow {
     pub(crate) fn new(owner: HWND) -> Result<Self> {
+        // Legacy child painting requires the owner's redirection surface.
+        // Windows rejects changing this creation-time style with SetWindowLong.
+        anyhow::ensure!(
+            unsafe { GetWindowLongPtrW(owner, GWL_EXSTYLE) } & WS_EX_NOREDIRECTIONBITMAP.0 as isize
+                == 0,
+            "create the window with WindowOptions::native_child_surfaces enabled"
+        );
         static CLASS: OnceLock<bool> = OnceLock::new();
         let registered = CLASS.get_or_init(|| unsafe {
             let class = WNDCLASSW {
@@ -301,6 +308,32 @@ mod tests {
         Win32::{Foundation::HWND, UI::WindowsAndMessaging::*},
         core::w,
     };
+
+    #[test]
+    fn native_overlay_rejects_an_owner_created_without_child_redirection() {
+        unsafe {
+            let owner = CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("STATIC"),
+                w!(""),
+                WS_OVERLAPPED,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("create hidden unredirected owner");
+            let error = NativeOverlayWindow::new(owner)
+                .err()
+                .expect("unredirected owner must be rejected");
+            assert!(error.to_string().contains("native_child_surfaces"));
+            DestroyWindow(owner).expect("destroy unredirected owner");
+        }
+    }
 
     #[test]
     fn owner_destruction_invalidates_the_overlay_before_its_rust_owner_drops() {
