@@ -42,6 +42,7 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    native_overlay: bool,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -58,6 +59,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.native_overlay = false;
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -135,17 +137,58 @@ impl Scene {
             }
         }
         self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+            .push(PaintOperation::Primitive(primitive, self.native_overlay));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive(primitive, overlay) => {
+                    let previous = self.native_overlay;
+                    self.native_overlay |= overlay;
+                    self.insert_primitive(primitive.clone());
+                    self.native_overlay = previous;
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
+    }
+
+    /// Change the target of subsequently recorded primitives, returning the
+    /// previous target. Cached paint operations retain their target on replay.
+    pub fn set_native_overlay(&mut self, overlay: bool) -> bool {
+        std::mem::replace(&mut self.native_overlay, overlay)
+    }
+
+    /// Split one layout/paint tree into the owner and transparent child-window
+    /// overlay surfaces. Layers are rebuilt independently to preserve ordering.
+    pub fn native_child_layers(&self) -> (Scene, Scene) {
+        let mut owner = Scene::default();
+        let mut overlay = Scene::default();
+        for operation in &self.paint_operations {
+            match operation {
+                PaintOperation::Primitive(primitive, on_overlay) => {
+                    let target = if *on_overlay {
+                        &mut overlay
+                    } else {
+                        &mut owner
+                    };
+                    target.insert_primitive(primitive.clone());
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    owner.push_layer(*bounds);
+                    overlay.push_layer(*bounds);
+                }
+                PaintOperation::EndLayer => {
+                    owner.pop_layer();
+                    overlay.pop_layer();
+                }
+            }
+        }
+        owner.finish();
+        overlay.finish();
+        (owner, overlay)
     }
 
     pub fn finish(&mut self) {
@@ -212,7 +255,7 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
-    Primitive(Primitive),
+    Primitive(Primitive, bool),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -546,6 +589,59 @@ pub struct Quad {
 impl From<Quad> for Primitive {
     fn from(quad: Quad) -> Self {
         Primitive::Quad(quad)
+    }
+}
+
+#[cfg(test)]
+mod native_overlay_tests {
+    use crate::{Bounds, ContentMask, Quad, ScaledPixels, Scene, point, size};
+
+    fn quad(x: f32) -> Quad {
+        let bounds = Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(0.)),
+            size(ScaledPixels(20.), ScaledPixels(20.)),
+        );
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Quad::default()
+        }
+    }
+
+    #[test]
+    fn cached_primitives_keep_their_surface_and_layer_order() {
+        let mut first = Scene::default();
+        first.insert_primitive(quad(0.));
+        first.push_layer(quad(10.).bounds);
+        let previous = first.set_native_overlay(true);
+        first.insert_primitive(quad(10.));
+        first.set_native_overlay(previous);
+        first.pop_layer();
+        first.insert_primitive(quad(15.));
+        let mut cached = Scene::default();
+        cached.replay(0..first.len(), &first);
+        cached.finish();
+        for scene in [&first, &cached] {
+            let (base, overlay) = scene.native_child_layers();
+            assert_eq!(base.quads.len(), 2);
+            assert_eq!(overlay.quads.len(), 1);
+            assert_eq!(overlay.quads[0].bounds, quad(10.).bounds);
+            assert!(base.quads[0].order <= base.quads[1].order);
+        }
+    }
+
+    #[test]
+    fn a_cached_base_subtree_can_be_presented_in_an_overlay_scope() {
+        let mut base = Scene::default();
+        base.insert_primitive(quad(0.));
+        let mut next = Scene::default();
+        next.set_native_overlay(true);
+        next.replay(0..base.len(), &base);
+        next.set_native_overlay(false);
+        next.insert_primitive(quad(10.));
+        let (owner, overlay) = next.native_child_layers();
+        assert_eq!(owner.quads[0].bounds, quad(10.).bounds);
+        assert_eq!(overlay.quads[0].bounds, quad(0.).bounds);
     }
 }
 

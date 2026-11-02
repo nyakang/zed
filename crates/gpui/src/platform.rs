@@ -1281,6 +1281,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Enable transparent owned-window presentation above native child windows.
+    /// Unsupported platforms must report failure rather than hiding children.
+    fn set_native_child_surface_mode(&self, enabled: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(!enabled, "native child overlay presentation is unavailable");
+        Ok(())
+    }
+    /// Interactive client-coordinate regions of the transparent overlay.
+    fn set_native_overlay_regions(&self, _regions: &[Bounds<Pixels>]) {}
+    /// Observe a native child's original mouse-down before it is delivered.
+    /// This callback must not synthesize or replay the input to the child.
+    fn on_native_child_mouse_down(&self, _callback: Box<dyn FnMut(crate::MouseDownEvent)>) {}
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

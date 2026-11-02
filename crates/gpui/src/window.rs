@@ -2,6 +2,7 @@
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::MouseDownEvent;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
@@ -849,6 +850,19 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// Input policy of the native overlay scope which created this hitbox.
+    pub native_overlay_input: Option<NativeOverlayInput>,
+}
+
+/// Input policy for content presented above native child windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOverlayInput {
+    /// Only interactive hitboxes receive pointer input.
+    Region,
+    /// Visual content (for example tooltips and drag previews) passes input through.
+    Passive,
+    /// The entire client area blocks input to native children.
+    Modal,
 }
 
 impl Hitbox {
@@ -1032,6 +1046,7 @@ impl std::ops::Deref for ElementIdStack {
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
+    native_overlay_input: NativeOverlayInput,
     parent_node: DispatchNodeId,
     element_id_stack: ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
@@ -1175,6 +1190,9 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
+            if hitbox.native_overlay_input == Some(NativeOverlayInput::Passive) {
+                continue;
+            }
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -1259,6 +1277,10 @@ pub struct Window {
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
     next_hitbox_id: HitboxId,
+    native_child_surface_mode: bool,
+    native_overlay_input: Option<NativeOverlayInput>,
+    native_child_dispatch: bool,
+    native_overlay_outside_down: Option<Box<dyn FnMut(&MouseDownEvent, &mut Window, &mut App)>>,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
@@ -2060,6 +2082,20 @@ impl Window {
                     .unwrap_or(DispatchEventResult::default())
             })
         });
+        platform_window.on_native_child_mouse_down({
+            let mut cx = cx.to_async();
+            Box::new(move |event| {
+                handle
+                    .update(&mut cx, |_, window, cx| {
+                        window.mouse_position = event.position;
+                        window.native_child_dispatch = true;
+                        cx.propagate_event = true;
+                        window.dispatch_mouse_event(&event, cx);
+                        window.native_child_dispatch = false;
+                    })
+                    .log_err();
+            })
+        });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
             Box::new(move || {
@@ -2164,6 +2200,10 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
+            native_child_surface_mode: false,
+            native_overlay_input: None,
+            native_child_dispatch: false,
+            native_overlay_outside_down: None,
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -3625,6 +3665,27 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        if self.native_child_surface_mode {
+            let modal = self
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .any(|hitbox| hitbox.native_overlay_input == Some(NativeOverlayInput::Modal));
+            let regions = if modal {
+                vec![Bounds::new(Point::default(), self.viewport_size)]
+            } else {
+                self.rendered_frame
+                    .hitboxes
+                    .iter()
+                    .filter(|hitbox| {
+                        hitbox.native_overlay_input == Some(NativeOverlayInput::Region)
+                    })
+                    .map(|hitbox| hitbox.bounds.intersect(&hitbox.content_mask.bounds))
+                    .filter(|bounds| !bounds.is_empty())
+                    .collect()
+            };
+            self.platform_window.set_native_overlay_regions(&regions);
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3635,6 +3696,42 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Enable composition above native child windows. The caller must surface
+    /// failure before creating a child which could cover application overlays.
+    pub fn set_native_child_surface_mode(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.platform_window
+            .set_native_child_surface_mode(enabled)?;
+        if self.native_child_surface_mode != enabled {
+            self.native_child_surface_mode = enabled;
+            self.refresh();
+        }
+        Ok(())
+    }
+
+    /// Observe an original outside press before its normal target handles it.
+    /// The callback must not replay or consume the input.
+    pub fn on_native_overlay_outside_mouse_down(
+        &mut self,
+        callback: impl FnMut(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.native_overlay_outside_down = Some(Box::new(callback));
+    }
+
+    /// Record layout hitboxes and paint operations for the same element tree
+    /// on the native overlay surface, preserving dispatch and focus ownership.
+    pub fn with_native_overlay<R>(
+        &mut self,
+        input: NativeOverlayInput,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_input = self.native_overlay_input.replace(input);
+        let previous_paint = self.next_frame.scene.set_native_overlay(true);
+        let result = f(self);
+        self.next_frame.scene.set_native_overlay(previous_paint);
+        self.native_overlay_input = previous_input;
+        result
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
@@ -3743,13 +3840,21 @@ impl Window {
                 .as_mut()
                 .unwrap()
                 .stretch_auto_size_to_fill(prompt_layout_id, root_size, scale_factor);
-            element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+            self.with_native_overlay(NativeOverlayInput::Modal, |window| {
+                window.insert_hitbox(
+                    Bounds::new(Point::default(), root_size),
+                    HitboxBehavior::Normal,
+                );
+                element.prepaint_as_root(Point::default(), root_size.into(), window, cx);
+            });
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any_element();
             let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+            self.with_native_overlay(NativeOverlayInput::Passive, |window| {
+                element.prepaint_as_root(offset, AvailableSpace::min_size(), window, cx);
+            });
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
@@ -3770,11 +3875,17 @@ impl Window {
         self.paint_deferred_draws(cx);
 
         if let Some(mut prompt_element) = prompt_element {
-            prompt_element.paint(self, cx);
+            self.with_native_overlay(NativeOverlayInput::Modal, |window| {
+                prompt_element.paint(window, cx)
+            });
         } else if let Some(mut drag_element) = active_drag_element {
-            drag_element.paint(self, cx);
+            self.with_native_overlay(NativeOverlayInput::Passive, |window| {
+                drag_element.paint(window, cx)
+            });
         } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
+            self.with_native_overlay(NativeOverlayInput::Passive, |window| {
+                tooltip_element.paint(window, cx)
+            });
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3872,8 +3983,10 @@ impl Window {
                 continue;
             }
 
-            self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
-                element.prepaint(window, cx)
+            self.with_native_overlay(NativeOverlayInput::Passive, |window| {
+                window.with_absolute_element_offset(tooltip_bounds.origin, |window| {
+                    element.prepaint(window, cx)
+                })
             });
 
             self.tooltip_bounds = Some(TooltipBounds {
@@ -3932,18 +4045,21 @@ impl Window {
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
 
                 let prepaint_start = self.prepaint_index();
-                if let Some(mut element) = element {
-                    self.with_rendered_view(current_view, |window| {
-                        window.with_rem_size(Some(rem_size), |window| {
-                            window.with_absolute_element_offset(absolute_offset, |window| {
-                                element.prepaint(window, cx);
+                let input = self.next_frame.deferred_draws[deferred_draw_ix].native_overlay_input;
+                self.with_native_overlay(input, |window| {
+                    if let Some(mut element) = element {
+                        window.with_rendered_view(current_view, |window| {
+                            window.with_rem_size(Some(rem_size), |window| {
+                                window.with_absolute_element_offset(absolute_offset, |window| {
+                                    element.prepaint(window, cx);
+                                });
                             });
                         });
-                    });
-                    self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
-                } else {
-                    self.reuse_prepaint(prepaint_range);
-                }
+                        window.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
+                    } else {
+                        window.reuse_prepaint(prepaint_range);
+                    }
+                });
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
                     prepaint_start..prepaint_end;
@@ -3976,17 +4092,19 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
-            if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
-                        });
+            self.with_native_overlay(deferred_draw.native_overlay_input, |window| {
+                if let Some(element) = deferred_draw.element.as_mut() {
+                    window.with_rendered_view(deferred_draw.current_view, |window| {
+                        window.with_content_mask(content_mask, |window| {
+                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                element.paint(window, cx);
+                            });
+                        })
                     })
-                })
-            } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
-            }
+                } else {
+                    window.reuse_paint(deferred_draw.paint_range.clone());
+                }
+            });
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
         }
@@ -4013,10 +4131,26 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let scope = self.native_overlay_input;
+        let viewport = Bounds::new(Point::default(), self.viewport_size);
+        let native_mode = self.native_child_surface_mode;
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
-                .cloned(),
+                .cloned()
+                .map(|mut hitbox| {
+                    hitbox.native_overlay_input = match scope {
+                        Some(NativeOverlayInput::Passive | NativeOverlayInput::Modal) => scope,
+                        _ => hitbox.native_overlay_input.or(scope),
+                    };
+                    if native_mode
+                        && hitbox.native_overlay_input == Some(NativeOverlayInput::Region)
+                        && hitbox.bounds.intersect(&viewport) == viewport
+                    {
+                        hitbox.bounds = Bounds::default();
+                    }
+                    hitbox
+                }),
         );
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
@@ -4055,6 +4189,7 @@ impl Window {
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
+                    native_overlay_input: deferred_draw.native_overlay_input,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
@@ -4531,6 +4666,9 @@ impl Window {
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
+            native_overlay_input: self
+                .native_overlay_input
+                .unwrap_or(NativeOverlayInput::Region),
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
@@ -5405,11 +5543,25 @@ impl Window {
         let content_mask = self.content_mask();
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
+        // Regional layers use viewport-sized shells for positioning only.
+        // Only an explicit Modal scope owns input over the whole viewport.
+        let bounds = if self.native_child_surface_mode
+            && self.native_overlay_input == Some(NativeOverlayInput::Region)
+            && bounds.origin.x <= Pixels::ZERO
+            && bounds.origin.y <= Pixels::ZERO
+            && bounds.size.width >= self.viewport_size.width
+            && bounds.size.height >= self.viewport_size.height
+        {
+            Bounds::default()
+        } else {
+            bounds
+        };
         let hitbox = Hitbox {
             id,
             bounds,
             content_mask,
             behavior,
+            native_overlay_input: self.native_overlay_input,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -5564,8 +5716,14 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        let overlay_listener = self.native_overlay_input.is_some();
         self.next_frame.mouse_listeners.push(Some(Box::new(
             move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                // A native child receives its original input exactly once. Only
+                // overlay capture listeners observe it to dismiss outside menus.
+                if window.native_child_dispatch && !overlay_listener {
+                    return;
+                }
                 if let Some(event) = event.downcast_ref() {
                     listener(event, phase, window, cx)
                 }
@@ -6088,6 +6246,23 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        if self.native_child_surface_mode
+            && let Some(event) = event.downcast_ref::<MouseDownEvent>()
+        {
+            let inside = self.rendered_frame.hitboxes.iter().any(|hitbox| {
+                matches!(
+                    hitbox.native_overlay_input,
+                    Some(NativeOverlayInput::Region | NativeOverlayInput::Modal)
+                ) && hitbox
+                    .bounds
+                    .intersect(&hitbox.content_mask.bounds)
+                    .contains(&event.position)
+            });
+            if !inside && let Some(mut callback) = self.native_overlay_outside_down.take() {
+                callback(event, self, cx);
+                self.native_overlay_outside_down = Some(callback);
+            }
+        }
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
@@ -6114,7 +6289,7 @@ impl Window {
         }
 
         // Bubble phase, where most normal handlers do their work.
-        if cx.propagate_event {
+        if cx.propagate_event && !self.native_child_dispatch {
             for listener in mouse_listeners.iter_mut().rev() {
                 let listener = listener.as_mut().unwrap();
                 listener(event, DispatchPhase::Bubble, self, cx);
@@ -10299,5 +10474,118 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+#[cfg(test)]
+mod native_overlay_tests {
+    use crate::window::HitboxId;
+    use crate::{
+        Bounds, ContentMask, DispatchPhase, Empty, Hitbox, HitboxBehavior, MouseDownEvent,
+        NativeOverlayInput, Point, TestAppContext, point, px, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    #[gpui::test]
+    fn native_overlay_regions_tooltip_passthrough_and_modal_blocking(cx: &mut TestAppContext) {
+        let handle = cx.add_window(|_, _| Empty);
+        handle
+            .update(cx, |_, window, _| {
+                let viewport = Bounds::new(Point::default(), window.viewport_size());
+                let menu = Bounds::new(point(px(20.), px(20.)), size(px(80.), px(60.)));
+                let hitbox = |id, bounds, input| Hitbox {
+                    id: HitboxId(id),
+                    bounds,
+                    content_mask: ContentMask { bounds: viewport },
+                    behavior: HitboxBehavior::BlockMouse,
+                    native_overlay_input: input,
+                };
+                window.rendered_frame.hitboxes = vec![
+                    hitbox(1, viewport, None),
+                    hitbox(2, menu, Some(NativeOverlayInput::Region)),
+                    hitbox(3, viewport, Some(NativeOverlayInput::Passive)),
+                ];
+                assert_eq!(
+                    window
+                        .rendered_frame
+                        .hit_test(point(px(30.), px(30.)))
+                        .ids
+                        .as_slice(),
+                    &[HitboxId(2)]
+                );
+                assert_eq!(
+                    window
+                        .rendered_frame
+                        .hit_test(point(px(150.), px(150.)))
+                        .ids
+                        .as_slice(),
+                    &[HitboxId(1)]
+                );
+                window.rendered_frame.hitboxes.push(hitbox(
+                    4,
+                    viewport,
+                    Some(NativeOverlayInput::Modal),
+                ));
+                assert_eq!(
+                    window
+                        .rendered_frame
+                        .hit_test(point(px(150.), px(150.)))
+                        .ids
+                        .as_slice(),
+                    &[HitboxId(4)]
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn native_overlay_outside_press_closes_first_and_original_dispatch_runs_once(
+        cx: &mut TestAppContext,
+    ) {
+        let handle = cx.add_window(|_, _| Empty);
+        let order = Rc::new(Cell::new(0));
+        handle
+            .update(cx, |_, window, cx| {
+                window.native_child_surface_mode = true;
+                let closed = order.clone();
+                window.on_native_overlay_outside_mouse_down(move |_, _, _| {
+                    assert_eq!(closed.get(), 0);
+                    closed.set(1);
+                });
+                let clicked = order.clone();
+                window.rendered_frame.mouse_listeners.push(Some(Box::new(
+                    move |_, phase, _, _| {
+                        if phase == DispatchPhase::Bubble {
+                            assert_eq!(clicked.get(), 1);
+                            clicked.set(2);
+                        }
+                    },
+                )));
+                cx.propagate_event = true;
+                window.dispatch_mouse_event(&MouseDownEvent::default(), cx);
+                assert_eq!(order.get(), 2);
+                // Native child already owns the original press. Observe dismissal
+                // without delivering a second GPUI bubble or replaying a Win32 event.
+                order.set(0);
+                window.native_child_dispatch = true;
+                cx.propagate_event = true;
+                window.dispatch_mouse_event(&MouseDownEvent::default(), cx);
+                assert_eq!(order.get(), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn native_overlay_passive_scope_preserves_keyboard_focus(cx: &mut TestAppContext) {
+        let handle = cx.add_window(|_, _| Empty);
+        handle
+            .update(cx, |_, window, cx| {
+                let focused = cx.focus_handle();
+                window.focus(&focused, cx);
+                window.with_native_overlay(NativeOverlayInput::Passive, |_| {});
+                assert_eq!(window.focused(cx), Some(focused));
+                assert_eq!(window.native_overlay_input, None);
+            })
+            .unwrap();
     }
 }

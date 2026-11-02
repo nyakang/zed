@@ -1,5 +1,20 @@
 # NyaTerm fork notes
 
+## 2026-11-02 native child overlay scopes
+
+Split a single window scene into owner and native overlay layers while retaining
+layout, focus, dispatch and cached primitives. Deferred content inherits its
+input policy; prompt/modal input covers the client, tooltip and drag previews
+are passive, and menu controls contribute only their own input regions. Full
+viewport positioning shells in regional scopes do not intercept input. Native
+child presses are observed before delivery without replaying them.
+
+Validation: Windows x64 `cargo test -p gpui --lib native_overlay` passed five
+tests for scene cache/layer replay, input regions, passive hit testing, modal
+blocking, outside press ordering/single dispatch, and passive focus retention.
+The consuming NyaTerm workspace check also passed with the editable fork.
+Real RDP/IME interaction acceptance remains with the consuming application.
+
 ## 2026-10-29 Windows IME composition caret notifications
 
 Windows IMEs may send `WM_IME_COMPOSITION` with `GCS_CURSORPOS` alone when
