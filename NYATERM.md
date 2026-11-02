@@ -1,5 +1,26 @@
 # NyaTerm fork notes
 
+## 2026-11-02 native child composition order
+
+NyaTerm's ActiveX control reported Connected and LoginComplete, with a visible
+drawing HWND, while GPUI's connecting placeholder remained on screen. The owner
+DirectComposition target used `topmost = true`, which composites it above all
+HWND children regardless of their Win32 visibility or sibling order.
+
+When native child mode is enabled, move only the owner's composition tree to
+the lower target. Scoped overlays keep their separate owned popup above the
+children. Restore the owner's upper target when native mode is disabled, and
+preserve the selected order after device recovery. Keep both target objects for
+repeated switches. A visual cannot be a root on both targets: detach the old root
+before attaching the new one, and commit the two changes together. Roll back the
+roots if committing the switch fails; both targets retire with the window.
+
+Validation: Windows x64 `cargo test -p gpui_windows --lib --features test-support
+--locked -j 1` passed 55 tests, with one ignored. The native composition regression
+asks the OS which target layer is occupied and exercises repeated/idempotent
+switches without a server or visible window. Real remote pixels and input are
+validated by the consuming NyaTerm application after pinning this patch.
+
 ## 2026-11-02 Windows owned overlay composition
 
 Present overlay primitives in a transparent, nonactivating popup owned by the

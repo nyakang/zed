@@ -120,7 +120,9 @@ impl Drop for Annotation<'_> {
 struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
+    alternate_target: Option<IDCompositionTarget>,
     comp_visual: IDCompositionVisual,
+    above_children: bool,
 }
 
 struct OverlayTarget {
@@ -318,8 +320,9 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition =
+            let mut composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
+            composition.set_above_children(self.hwnd, self.overlay_hwnd.is_none())?;
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
@@ -379,6 +382,11 @@ impl DirectXRenderer {
             hwnd.is_none() || self.direct_composition.is_some(),
             "native child overlays require DirectComposition"
         );
+        if let Some(composition) = self.direct_composition.as_mut() {
+            // The owner scene must sit below HWND children. Only the separate
+            // owned popup presents explicitly scoped menus and dialogs above them.
+            composition.set_above_children(self.hwnd, hwnd.is_none())?;
+        }
         self.overlay_target.take();
         self.overlay_hwnd = hwnd;
         self.ensure_overlay_target()
@@ -1095,8 +1103,47 @@ impl DirectComposition {
         Ok(Self {
             comp_device,
             comp_target,
+            alternate_target: None,
             comp_visual,
+            above_children: true,
         })
+    }
+
+    fn set_above_children(&mut self, hwnd: HWND, above_children: bool) -> Result<()> {
+        if self.above_children == above_children {
+            return Ok(());
+        }
+        unsafe {
+            // Keep the two HWND layers for repeated native-mode switches.
+            if self.alternate_target.is_none() {
+                self.alternate_target = Some(
+                    self.comp_device
+                        .CreateTargetForHwnd(hwnd, above_children)
+                        .context("create alternate composition target")?,
+                );
+            }
+            let target = self
+                .alternate_target
+                .as_mut()
+                .context("missing alternate composition target")?;
+            // A visual cannot be a root on both targets. Detach first, then
+            // attach and commit both changes together to avoid a blank frame.
+            self.comp_target
+                .SetRoot(None::<&IDCompositionVisual>)
+                .context("detach old composition root")?;
+            if let Err(error) = target
+                .SetRoot(&self.comp_visual)
+                .and_then(|()| self.comp_device.Commit())
+            {
+                target.SetRoot(None::<&IDCompositionVisual>).log_err();
+                self.comp_target.SetRoot(&self.comp_visual).log_err();
+                self.comp_device.Commit().log_err();
+                return Err(error).context("attach switched composition root and commit");
+            }
+            std::mem::swap(&mut self.comp_target, target);
+        }
+        self.above_children = above_children;
+        Ok(())
     }
 
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
@@ -1106,6 +1153,90 @@ impl DirectComposition {
             self.comp_device.Commit()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_composition_tests {
+    use anyhow::{Context, Result, anyhow};
+    use gpui_util::ResultExt;
+    use windows::{
+        Win32::{
+            Foundation::HWND,
+            Graphics::{
+                DirectComposition::{DCompositionCreateDevice, IDCompositionDevice},
+                Dxgi::IDXGIDevice,
+            },
+            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
+            },
+        },
+        core::w,
+    };
+
+    use super::DirectComposition;
+
+    #[test]
+    fn native_child_composition_uses_the_lower_target_and_reuses_targets_when_switching()
+    -> Result<()> {
+        std::thread::spawn(|| -> Result<()> {
+            struct Apartment;
+            impl Drop for Apartment {
+                fn drop(&mut self) {
+                    unsafe { CoUninitialize() };
+                }
+            }
+            struct Parent(HWND);
+            impl Drop for Parent {
+                fn drop(&mut self) {
+                    unsafe { DestroyWindow(self.0) }.log_err();
+                }
+            }
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+                let _apartment = Apartment;
+                let parent = Parent(CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("GPUI compositor test"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    800,
+                    600,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?);
+                // No swap chain, GPU readback, visible window, or remote server.
+                let device: IDCompositionDevice = DCompositionCreateDevice(None::<&IDXGIDevice>)
+                    .context("create test composition device")?;
+                let mut composition = DirectComposition {
+                    comp_target: device
+                        .CreateTargetForHwnd(parent.0, true)
+                        .context("create test upper target")?,
+                    alternate_target: None,
+                    comp_visual: device.CreateVisual().context("create test visual")?,
+                    comp_device: device.clone(),
+                    above_children: true,
+                };
+                composition.comp_target.SetRoot(&composition.comp_visual)?;
+                device.Commit()?;
+                for above in [false, false, true, true, false, true] {
+                    composition
+                        .set_above_children(parent.0, above)
+                        .with_context(|| format!("switch above_children to {above}"))?;
+                    // Windows allows one target per HWND per layer. Ask the OS
+                    // which layer is occupied, rather than checking our flag.
+                    assert!(device.CreateTargetForHwnd(parent.0, above).is_err());
+                }
+            }
+            Ok(())
+        })
+        .join()
+        .map_err(|_| anyhow!("compositor test thread panicked"))?
     }
 }
 
