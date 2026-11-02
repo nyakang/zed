@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use gpui::{Bounds, Pixels};
+use gpui_util::ResultExt;
 use windows::{
     Win32::{
         Foundation::*,
@@ -24,7 +25,9 @@ struct OverlayData {
     owner: HWND,
     regions: RefCell<Vec<RECT>>,
     hwnd: Cell<HWND>,
+    input_hwnd: Cell<HWND>,
     attached: Cell<bool>,
+    input_attached: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -56,21 +59,36 @@ impl NativeOverlayWindow {
                 lpszClassName: w!("GPUI.NativeOverlay"),
                 ..Default::default()
             };
-            RegisterClassW(&class) != 0
+            if RegisterClassW(&class) == 0 {
+                return false;
+            }
+            let input_class = WNDCLASSW {
+                lpfnWndProc: Some(input_proc),
+                lpszClassName: w!("GPUI.NativeOverlayInput"),
+                ..class
+            };
+            RegisterClassW(&input_class) != 0
         });
         anyhow::ensure!(*registered, "register native overlay class");
         let data = Rc::new(OverlayData {
             owner,
             regions: RefCell::default(),
             hwnd: Cell::default(),
+            input_hwnd: Cell::default(),
             attached: Cell::new(false),
+            input_attached: Cell::new(false),
         });
+        let instance = unsafe { GetModuleHandleW(None)? };
         // This extra reference belongs to the HWND until WM_NCDESTROY. The
         // caller's reference also covers failed creation and reentrant messages.
         let raw = Rc::into_raw(data.clone());
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+                WS_EX_NOACTIVATE
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOREDIRECTIONBITMAP
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT,
                 w!("GPUI.NativeOverlay"),
                 w!(""),
                 WS_POPUP,
@@ -80,7 +98,7 @@ impl NativeOverlayWindow {
                 1,
                 Some(owner),
                 None,
-                Some(GetModuleHandleW(None)?.into()),
+                Some(instance.into()),
                 Some(raw.cast()),
             )
         };
@@ -98,6 +116,40 @@ impl NativeOverlayWindow {
             }
         };
         let overlay = Self { data };
+        // HTTRANSPARENT alone does not provide global pointer transparency.
+        // Keep the visual popup out of hit testing, and use a separate regioned
+        // layered window for interactive GPUI areas only.
+        unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) }?;
+        let raw_input = Rc::into_raw(overlay.data.clone());
+        let input = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                w!("GPUI.NativeOverlayInput"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(instance.into()),
+                Some(raw_input.cast()),
+            )
+        };
+        let input = match input {
+            Ok(input) => input,
+            Err(error) => {
+                if !overlay.data.input_attached.get() {
+                    unsafe {
+                        drop(Rc::from_raw(raw_input));
+                    }
+                }
+                return Err(error).context("create native overlay input window");
+            }
+        };
+        unsafe { SetLayeredWindowAttributes(input, COLORREF(0), 1, LWA_ALPHA) }?;
+        overlay.apply_input_region(&[])?;
         MOUSE_HOOK.with(|hook| -> Result<()> {
             let mut hook = hook.borrow_mut();
             if hook.handle.is_invalid() {
@@ -118,7 +170,7 @@ impl NativeOverlayWindow {
     }
 
     pub(crate) fn set_regions(&self, regions: &[Bounds<Pixels>], scale: f32) {
-        let rectangles = regions
+        let rectangles: Vec<RECT> = regions
             .iter()
             .map(|bounds| RECT {
                 left: (bounds.left().as_f32() * scale).floor() as i32,
@@ -127,7 +179,52 @@ impl NativeOverlayWindow {
                 bottom: (bounds.bottom().as_f32() * scale).ceil() as i32,
             })
             .collect();
+        if *self.data.regions.borrow() == rectangles {
+            return;
+        }
+        if self.apply_input_region(&rectangles).log_err().is_none() {
+            return;
+        }
         *self.data.regions.borrow_mut() = rectangles;
+        self.sync();
+    }
+
+    fn apply_input_region(&self, rectangles: &[RECT]) -> Result<()> {
+        unsafe {
+            let region = CreateRectRgn(0, 0, 0, 0);
+            anyhow::ensure!(!region.is_invalid(), "create native overlay input region");
+            for rect in rectangles {
+                let rectangle = CreateRectRgnIndirect(rect);
+                if rectangle.is_invalid() {
+                    DeleteObject(region.into())
+                        .ok()
+                        .context("release input region")
+                        .log_err();
+                    anyhow::bail!("create native overlay input rectangle");
+                }
+                let combined = CombineRgn(Some(region), Some(region), Some(rectangle), RGN_OR);
+                DeleteObject(rectangle.into())
+                    .ok()
+                    .context("release input rectangle")
+                    .log_err();
+                if combined == GDI_REGION_TYPE(0) {
+                    DeleteObject(region.into())
+                        .ok()
+                        .context("release input region")
+                        .log_err();
+                    anyhow::bail!("combine native overlay input region");
+                }
+            }
+            if SetWindowRgn(self.data.input_hwnd.get(), Some(region), true) == 0 {
+                DeleteObject(region.into())
+                    .ok()
+                    .context("release input region")
+                    .log_err();
+                anyhow::bail!("set native overlay input region");
+            }
+            // A successful SetWindowRgn transfers the GDI region to Windows.
+            Ok(())
+        }
     }
 
     pub(crate) fn sync(&self) {
@@ -135,6 +232,7 @@ impl NativeOverlayWindow {
             let owner = self.data.owner;
             if !IsWindowVisible(owner).as_bool() || IsIconic(owner).as_bool() {
                 let _ = ShowWindow(self.hwnd(), SW_HIDE);
+                let _ = ShowWindow(self.data.input_hwnd.get(), SW_HIDE);
                 return;
             }
             let mut rect = RECT::default();
@@ -155,6 +253,23 @@ impl NativeOverlayWindow {
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
             );
             let _ = ShowWindow(self.hwnd(), SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                self.data.input_hwnd.get(),
+                Some(HWND_TOP),
+                origin.x,
+                origin.y,
+                rect.right,
+                rect.bottom,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+            let _ = ShowWindow(
+                self.data.input_hwnd.get(),
+                if self.data.regions.borrow().is_empty() {
+                    SW_HIDE
+                } else {
+                    SW_SHOWNOACTIVATE
+                },
+            );
         }
     }
 }
@@ -162,6 +277,9 @@ impl NativeOverlayWindow {
 impl Drop for NativeOverlayWindow {
     fn drop(&mut self) {
         unsafe {
+            if !self.data.input_hwnd.get().is_invalid() {
+                DestroyWindow(self.data.input_hwnd.get()).log_err();
+            }
             let _ = DestroyWindow(self.hwnd());
         }
         MOUSE_HOOK.with(|hook| {
@@ -226,6 +344,20 @@ unsafe extern "system" fn overlay_proc(
     wp: WPARAM,
     lp: LPARAM,
 ) -> LRESULT {
+    unsafe { overlay_message(hwnd, message, wp, lp, false) }
+}
+
+unsafe extern "system" fn input_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe { overlay_message(hwnd, message, wp, lp, true) }
+}
+
+unsafe fn overlay_message(
+    hwnd: HWND,
+    message: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    input: bool,
+) -> LRESULT {
     if message == WM_NCCREATE {
         let create = unsafe { &*(lp.0 as *const CREATESTRUCTW) };
         let data = create.lpCreateParams as *const OverlayData;
@@ -233,8 +365,13 @@ unsafe extern "system" fn overlay_proc(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as isize);
         }
         unsafe {
-            (*data).attached.set(true);
-            (*data).hwnd.set(hwnd);
+            if input {
+                (*data).input_attached.set(true);
+                (*data).input_hwnd.set(hwnd);
+            } else {
+                (*data).attached.set(true);
+                (*data).hwnd.set(hwnd);
+            }
         }
     }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const OverlayData;
@@ -292,7 +429,11 @@ unsafe extern "system" fn overlay_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => unsafe {
-            data.hwnd.set(HWND::default());
+            if input {
+                data.input_hwnd.set(HWND::default());
+            } else {
+                data.hwnd.set(HWND::default());
+            }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(Rc::from_raw(pointer));
             DefWindowProcW(hwnd, message, wp, lp)
@@ -304,10 +445,59 @@ unsafe extern "system" fn overlay_proc(
 #[cfg(test)]
 mod tests {
     use super::NativeOverlayWindow;
+    use gpui::{Bounds, point, px, size};
     use windows::{
-        Win32::{Foundation::HWND, UI::WindowsAndMessaging::*},
+        Win32::{Foundation::HWND, Graphics::Gdi::*, UI::WindowsAndMessaging::*},
         core::w,
     };
+
+    #[test]
+    fn interactive_regions_are_scaled_replaced_and_separate_from_pointer_transparent_visuals() {
+        unsafe {
+            let owner = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_OVERLAPPED,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("create hidden region-test owner");
+            let overlay = NativeOverlayWindow::new(owner).expect("create native overlay pair");
+            let visual_style = GetWindowLongPtrW(overlay.hwnd(), GWL_EXSTYLE);
+            assert_ne!(visual_style & WS_EX_LAYERED.0 as isize, 0);
+            assert_ne!(visual_style & WS_EX_TRANSPARENT.0 as isize, 0);
+            let region = CreateRectRgn(0, 0, 0, 0);
+            assert!(!region.is_invalid());
+            overlay.set_regions(
+                &[Bounds::new(point(px(10.), px(20.)), size(px(15.), px(10.)))],
+                2.,
+            );
+            assert_ne!(
+                GetWindowRgn(overlay.data.input_hwnd.get(), region),
+                GDI_REGION_TYPE(0)
+            );
+            assert!(PtInRegion(region, 25, 45).as_bool());
+            assert!(!PtInRegion(region, 5, 5).as_bool());
+            overlay.set_regions(&[], 2.);
+            assert_eq!(
+                GetWindowRgn(overlay.data.input_hwnd.get(), region),
+                NULLREGION
+            );
+            assert!(!PtInRegion(region, 25, 45).as_bool());
+            assert!(DeleteObject(region.into()).as_bool());
+            DestroyWindow(owner).expect("destroy overlay owner");
+            assert!(overlay.hwnd().is_invalid());
+            assert!(overlay.data.input_hwnd.get().is_invalid());
+            drop(overlay);
+        }
+    }
 
     #[test]
     fn native_overlay_rejects_an_owner_created_without_child_redirection() {

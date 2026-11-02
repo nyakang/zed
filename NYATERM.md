@@ -1,5 +1,21 @@
 # NyaTerm fork notes
 
+## 2026-11-02 native overlay pointer routing
+
+Separate the DirectComposition visual popup from a regioned input popup.
+The visual window uses layered pointer transparency, including passive tooltips;
+the input window only covers interactive GPUI regions. HTTRANSPARENT on the
+previous full-window popup did not deliver actual mouse presses to the RDP
+control, although its keyboard input and drawing worked. No mouse events are
+replayed into the native control. Empty regions remove the input popup from
+hit testing, and updated regions replace the previous region at the current DPI.
+Both HWND contexts survive reentrant messages and are invalidated on owner exit.
+
+Validation: serialized Windows library tests passed 57 tests, zero failures,
+one ignored, including actual GDI region scaling/replacement and destruction of
+both popups. rustfmt and git diff --check passed. Real RDP mouse and overlay
+acceptance is performed in the consuming NyaTerm application after pinning.
+
 ## 2026-11-02 native child owner redirection
 
 The lower composition target alone did not expose ActiveX pixels in NyaTerm's
