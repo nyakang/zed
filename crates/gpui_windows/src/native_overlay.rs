@@ -24,6 +24,7 @@ struct OverlayData {
     owner: HWND,
     regions: RefCell<Vec<RECT>>,
     hwnd: Cell<HWND>,
+    attached: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -55,6 +56,7 @@ impl NativeOverlayWindow {
             owner,
             regions: RefCell::default(),
             hwnd: Cell::default(),
+            attached: Cell::new(false),
         });
         // This extra reference belongs to the HWND until WM_NCDESTROY. The
         // caller's reference also covers failed creation and reentrant messages.
@@ -80,7 +82,7 @@ impl NativeOverlayWindow {
             Err(error) => {
                 // WM_NCDESTROY releases the reference if WM_NCCREATE ran.
                 // A failure before WM_NCCREATE leaves it to this branch.
-                if data.hwnd.get().is_invalid() {
+                if !data.attached.get() {
                     unsafe {
                         drop(Rc::from_raw(raw));
                     }
@@ -224,6 +226,7 @@ unsafe extern "system" fn overlay_proc(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as isize);
         }
         unsafe {
+            (*data).attached.set(true);
             (*data).hwnd.set(hwnd);
         }
     }
@@ -231,7 +234,10 @@ unsafe extern "system" fn overlay_proc(
     if pointer.is_null() {
         return unsafe { DefWindowProcW(hwnd, message, wp, lp) };
     }
-    let data = unsafe { &*pointer };
+    // Forwarded input and activation can synchronously destroy this HWND.
+    // Keep its context alive until this invocation of the procedure returns.
+    unsafe { Rc::increment_strong_count(pointer) };
+    let data = unsafe { Rc::from_raw(pointer) };
     match message {
         WM_NCHITTEST => {
             let mut position = POINT {
@@ -279,10 +285,46 @@ unsafe extern "system" fn overlay_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => unsafe {
+            data.hwnd.set(HWND::default());
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(Rc::from_raw(pointer));
             DefWindowProcW(hwnd, message, wp, lp)
         },
         _ => unsafe { DefWindowProcW(hwnd, message, wp, lp) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeOverlayWindow;
+    use windows::{
+        Win32::{Foundation::HWND, UI::WindowsAndMessaging::*},
+        core::w,
+    };
+
+    #[test]
+    fn owner_destruction_invalidates_the_overlay_before_its_rust_owner_drops() {
+        unsafe {
+            let owner = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_OVERLAPPED,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("create hidden test owner");
+            let overlay = NativeOverlayWindow::new(owner).expect("create owned overlay");
+            assert_ne!(overlay.hwnd(), HWND::default());
+            DestroyWindow(owner).expect("destroy owner and owned window");
+            assert_eq!(overlay.hwnd(), HWND::default());
+            drop(overlay);
+        }
     }
 }

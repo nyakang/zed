@@ -594,3 +594,16 @@ in native export fixtures and explicitly expect the UI-thread spawn prohibition
 only on the synchronous foreign-process unit-test fixture. The final four
 texture regressions and 49 native Windows tests passed again. These changes
 only affect test helpers and preserve the runtime patch series.
+
+### Overlay HWND reentrancy lifetime
+
+The overlay window procedure retains its context across forwarded input and
+activation, which can synchronously destroy the window. WM_NCDESTROY invalidates
+the HWND; a separate attachment marker balances the creation reference even when
+CreateWindowEx fails after WM_NCCREATE. An owner-destruction regression test uses
+hidden Win32 windows without a remote server.
+
+Windows validation: `cargo test -p gpui_windows --lib --features gpui/test-support
+owner_destruction_invalidates --target-dir E:/Projects/Rust/nyaterm/target` passed
+(1 test). `rustfmt --edition 2024 crates/gpui_windows/src/native_overlay.rs` and
+`git diff --check` passed. Real RDP/IME and ARM64 hardware acceptance remain pending.
