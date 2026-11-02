@@ -1,5 +1,19 @@
 # NyaTerm fork notes
 
+## 2026-11-02 native child input thread observation
+
+Use a UI-thread low-level mouse hook, filtered to descendants of the registered
+owner, for outside-click notification. ActiveX input can live on private threads;
+the previous UI-thread WH_MOUSE hook missed real RDP clicks, leaving GPUI menus
+open even after native mouse input was restored. The callback runs on the
+installing thread, keeps Rc state thread-bound, does not consume the click, and
+does not replay input into the control.
+
+Validation: 57 serialized Windows library tests passed, zero failures, one
+ignored; rustfmt and whitespace checks passed. NyaTerm real RDP validation of the
+preceding revision confirmed left/right clicks and overlay drawing, and exposed
+the outside-click gap fixed here. Final acceptance follows in the consumer.
+
 ## 2026-11-02 native overlay pointer routing
 
 Separate the DirectComposition visual popup from a regioned input popup.

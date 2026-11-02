@@ -13,7 +13,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+        System::LibraryLoader::GetModuleHandleW,
         UI::{Controls::WM_MOUSELEAVE, Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::*},
     },
     core::w,
@@ -154,7 +154,7 @@ impl NativeOverlayWindow {
             let mut hook = hook.borrow_mut();
             if hook.handle.is_invalid() {
                 hook.handle = unsafe {
-                    SetWindowsHookExW(WH_MOUSE, Some(mouse_hook), None, GetCurrentThreadId())
+                    SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), Some(instance.into()), 0)
                 }?;
             }
             hook.overlays.push(Rc::downgrade(&overlay.data));
@@ -306,7 +306,11 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, parameter: LPAR
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
         )
     {
-        let mouse = unsafe { &*(parameter.0 as *const MOUSEHOOKSTRUCT) };
+        // ActiveX may create its input HWND on a private thread. A low-level
+        // hook runs on this installing UI thread, keeping Rc/GPUI access local
+        // while observing clicks destined for those child HWNDs as well.
+        let mouse = unsafe { &*(parameter.0 as *const MSLLHOOKSTRUCT) };
+        let target = unsafe { WindowFromPoint(mouse.pt) };
         // Release the registry borrow before dispatch: closing a menu can
         // destroy a window or start another native host.
         let overlays = MOUSE_HOOK.with(|hook| {
@@ -317,7 +321,7 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, parameter: LPAR
                 .collect::<Vec<_>>()
         });
         for data in overlays {
-            if unsafe { IsChild(data.owner, mouse.hwnd) }.as_bool() {
+            if unsafe { IsChild(data.owner, target) }.as_bool() {
                 let mut position = mouse.pt;
                 if unsafe { ScreenToClient(data.owner, &mut position) }.as_bool() {
                     let packed =
