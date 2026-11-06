@@ -1748,9 +1748,128 @@ mod test {
 
     use crate::{
         self as gpui, AnyElement, AppContext, Bounds, Context, Element, FollowMode,
-        InteractiveElement, IntoElement, ListOffset, ListState, Pixels, Render, Styled,
-        TestAppContext, VisualTestContext, Window, canvas, div, list, point, px, size,
+        InteractiveElement, IntoElement, ListOffset, ListState, ParentElement, Pixels, Render,
+        StatefulInteractiveElement, Styled, TestAppContext, VisualTestContext, Window, canvas, div,
+        list, point, px, size,
     };
+
+    #[cfg(not(target_family = "wasm"))]
+    #[gpui::test]
+    fn autoscroll_retry_publishes_only_final_accessibility_nodes(cx: &mut TestAppContext) {
+        struct AccessibleList {
+            state: ListState,
+            request: Rc<Cell<bool>>,
+            child: usize,
+            reveal: std::ops::Range<f32>,
+            painted: Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>,
+            focus: Vec<crate::FocusHandle>,
+        }
+        impl Render for AccessibleList {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let request = self.request.clone();
+                let child = self.child;
+                let reveal = self.reveal.clone();
+                let painted = self.painted.clone();
+                let focus = self.focus.clone();
+                div().id("accessible-list").role(crate::Role::Log).child(
+                    list(self.state.clone(), move |index, _, _| {
+                        let request = request.clone();
+                        let reveal = reveal.clone();
+                        let painted = painted.clone();
+                        div()
+                            .id(("accessible-row", index))
+                            .role(crate::Role::Button)
+                            .aria_label(format!("row-{index}"))
+                            .track_focus(&focus[index])
+                            .h(px(100.))
+                            .w_full()
+                            .child(
+                                canvas(
+                                    move |bounds, window, _| {
+                                        if index == child && request.get() {
+                                            window.request_autoscroll(Bounds::from_corners(
+                                                point(
+                                                    bounds.left(),
+                                                    bounds.top() + px(reveal.start),
+                                                ),
+                                                point(
+                                                    bounds.right(),
+                                                    bounds.top() + px(reveal.end),
+                                                ),
+                                            ));
+                                        }
+                                    },
+                                    move |bounds, _, _, _| {
+                                        painted.borrow_mut().push((index, bounds))
+                                    },
+                                )
+                                .size_full(),
+                            )
+                            .into_any_element()
+                    })
+                    .w(px(100.))
+                    .h(px(200.)),
+                )
+            }
+        }
+
+        for (child, reveal, expected) in [
+            (2, 40.0..45.0, list_offset(2, 40.)),
+            (4, 80.0..90.0, list_offset(2, 90.)),
+        ] {
+            let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+            state.scroll_to(list_offset(2, 50.));
+            let request = Rc::new(Cell::new(false));
+            let painted = Rc::new(RefCell::new(Vec::new()));
+            let (view, vcx) = cx.add_window_view(|_, cx| AccessibleList {
+                state: state.clone(),
+                request: request.clone(),
+                child,
+                reveal,
+                painted: painted.clone(),
+                focus: (0..10).map(|_| cx.focus_handle()).collect(),
+            });
+            assert!(vcx.activate_accessibility());
+            vcx.update(|window, cx| {
+                let focus = view.read(cx).focus[3].clone();
+                focus.focus(window, cx);
+            });
+            request.set(true);
+            state.scroll_to(list_offset(2, 50.));
+            painted.borrow_mut().clear();
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                assert!(view.read(cx).focus[3].is_focused(window));
+                let tree: serde_json::Value =
+                    serde_json::from_str(&window.debug_a11y_tree_json().unwrap()).unwrap();
+                let nodes = tree["nodes"].as_object().unwrap();
+                let log = nodes
+                    .values()
+                    .find(|node| node["aria"]["role"] == "Log")
+                    .unwrap();
+                let children = log["children"].as_array().unwrap();
+                assert_eq!(children.len(), painted.borrow().len());
+                let mut ids = collections::FxHashSet::default();
+                for (index, bounds) in painted.borrow().iter() {
+                    let label = format!("row-{index}");
+                    let (key, node) = nodes
+                        .iter()
+                        .find(|(_, node)| node["aria"]["label"] == label)
+                        .unwrap();
+                    assert!(children.iter().any(|child| child.as_str() == Some(key)));
+                    let id =
+                        accesskit::NodeId(node["accesskit_id"].as_str().unwrap().parse().unwrap());
+                    assert!(ids.insert(id));
+                    assert_eq!(window.a11y.node_bounds[&id], *bounds);
+                    if *index == 3 {
+                        assert_eq!(tree["gpui_focus"].as_str(), Some(key.as_str()));
+                    }
+                }
+            });
+            assert_eq!(state.logical_scroll_top(), expected);
+        }
+    }
 
     #[gpui::test]
     fn test_autoscroll_above_item_top_renders_items_above(cx: &mut TestAppContext) {

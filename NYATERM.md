@@ -784,3 +784,37 @@ Windows validation: `cargo test -p gpui_windows --lib --features gpui/test-suppo
 owner_destruction_invalidates --target-dir E:/Projects/Rust/nyaterm/target` passed
 (1 test). `rustfmt --edition 2024 crates/gpui_windows/src/native_overlay.rs` and
 `git diff --check` passed. Real RDP/IME and ARM64 hardware acceptance remain pending.
+
+## 2026-11-06 accessibility rollback for prepaint retries
+
+An accessible virtual list can prepaint its children twice in one frame when a
+child requests autoscroll. `Window::transact` discarded hitboxes and dispatch
+nodes from the aborted pass, but retained its accessibility nodes, causing
+`Duplicate a11y node id` panics in debug builds and missing nodes in release.
+NyaTerm's AI-history disclosure controls reproduced this with distinct IDs.
+
+Checkpoint accessibility state alongside the existing prepaint state. Restore
+open ancestors, their child references and metadata, focus and active descendant,
+focus mappings, node bounds and append-only action-listener lengths on failure.
+Remove aborted real and synthetic node IDs and debug provenance before retry.
+Completed nodes are not copied; inactive accessibility skips node-stack copies.
+Nested transactions and the real-duplicate assertion retain their semantics.
+No public API or persisted-data changes.
+
+Linux validation in the reduced fork workspace:
+- `cargo test -p gpui --lib -- --test-threads=1`: 453 passed, two ignored,
+  including six checkpoint tests and an up/down autoscroll regression that
+  verifies final node bounds, parent references and focused-node publication.
+- `cargo fmt -p gpui -- --check` and `git diff --check` passed.
+- `cargo clippy -p gpui --lib --tests -- -A clippy::approx_constant
+  -A clippy::redundant_clone` passed. Unmodified upstream code blocks the
+  default command on Rust 1.99: the approximate golden ratio in `geometry.rs`
+  and a redundant clone in an existing `window.rs` pointer-cancellation test.
+  Both exceptions are limited to validation command flags, not source changes.
+- The consuming NyaTerm disclosure regression fails on the old pinned revision
+  with the same duplicate-node panic; it also tests mouse and keyboard activation
+  after retry when consuming the fix.
+
+Windows native execution and the original complete AI-history scenario have not
+been tested in this Linux environment. The Linux adapter's existing unused
+`wl_pointer` warning is unrelated to this change.
