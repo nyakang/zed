@@ -1,6 +1,6 @@
 use crate::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
+    A11yCallbacks, AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs,
+    HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
     TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
@@ -32,6 +32,7 @@ pub(crate) struct TestWindowState {
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     close_callback: Option<Box<dyn FnOnce()>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+    a11y_callbacks: Option<A11yCallbacks>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     visibility: WindowVisibility,
@@ -108,6 +109,7 @@ impl TestWindow {
             should_close_handler: None,
             close_callback: None,
             hit_test_window_control_callback: None,
+            a11y_callbacks: None,
             input_callback: None,
             active_status_change_callback: None,
             visibility: WindowVisibility::Visible,
@@ -144,6 +146,38 @@ impl TestWindow {
         if let Some(callback) = callback {
             callback();
         }
+    }
+
+    pub(crate) fn activate_accessibility(&self) -> bool {
+        let callbacks = self.0.lock().a11y_callbacks.take();
+        let Some(callbacks) = callbacks else {
+            return false;
+        };
+        // Platform callbacks can schedule window updates; never hold the test
+        // window lock while invoking them.
+        let activated = (callbacks.activation)().is_some();
+        self.0.lock().a11y_callbacks = Some(callbacks);
+        activated
+    }
+
+    pub(crate) fn simulate_accessibility_action(&self, request: accesskit::ActionRequest) {
+        let callbacks = self
+            .0
+            .lock()
+            .a11y_callbacks
+            .take()
+            .expect("accessibility is enabled");
+        (callbacks.action)(request);
+        self.0.lock().a11y_callbacks = Some(callbacks);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hit_test_window_control(&self) -> Option<WindowControlArea> {
+        let callback = self.0.lock().hit_test_window_control_callback.take();
+        let mut callback = callback?;
+        let area = callback();
+        self.0.lock().hit_test_window_control_callback = Some(callback);
+        area
     }
 
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -321,6 +355,11 @@ impl TestWindow {
 }
 
 impl PlatformWindow for TestWindow {
+    #[cfg(not(target_family = "wasm"))]
+    fn a11y_init(&self, callbacks: A11yCallbacks) {
+        self.0.lock().a11y_callbacks = Some(callbacks);
+    }
+
     fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
         let state = self.0.lock();
         state

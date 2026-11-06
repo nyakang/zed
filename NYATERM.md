@@ -1,5 +1,25 @@
 # NyaTerm fork notes
 
+## 2026-11-06 platform accessibility regression support
+
+Test windows retain the normal accessibility callbacks, invoked outside the
+window lock. `VisualTestContext::activate_accessibility() -> bool` connects a
+simulated client and draws the real tree;
+`VisualTestContext::simulate_accessibility_action(accesskit::ActionRequest)`
+routes requests through the normal platform callback and draws after queued
+updates. Both additions belong to test support and exclude wasm. They let
+consumers reproduce focus-tree failures instead of inspecting only projected
+component semantics. A test-only native control callback accessor also permits
+borrow-reentrancy checks.
+
+Validation: the consuming-dependency validation workspace ran the GPUI library
+suite on Linux with Rust 1.99: 446 passed, zero failures, two ignored. This
+includes callback activation/action delivery while App is mutably borrowed,
+disabled accessibility, and native control tests in the next patch. Touched
+Rust files pass rustfmt and git diff --check. Windows native library tests are
+run by the branch CI; real Windows settings/RDP acceptance is pending because
+no interactive Windows execution endpoint is available.
+
 ## Current fixed upstream sync (2026-11-03)
 
 Replayed the file export/promise, dynamic texture, cursor, gesture cancellation, modal owner, IME and native overlay patches onto `f4d40a2ccb88dd660abd81b85256c0ffe7e25efb`.
