@@ -16,8 +16,10 @@ hit testing while App is already mutably borrowed, covers Drag/Close/Max/Min
 and ordinary content, and checks control movement and occlusion changes
 without pointer movement. The new platform accessibility tests also pass.
 Touched-file rustfmt and git diff --check pass. Windows backend and GPUI tests
-are covered by the branch CI; real Windows titlebar/settings/native RDP
-acceptance remains pending because no Windows execution endpoint is available.
+are configured in the branch CI, but dispatch returned HTTP 422 because
+Actions is disabled for this fork. Windows automated tests and real
+titlebar/settings/native RDP acceptance remain unverified; no Windows
+execution endpoint is available.
 
 ## 2026-11-06 platform accessibility regression support
 
@@ -36,8 +38,9 @@ suite on Linux with Rust 1.99: 446 passed, zero failures, two ignored. This
 includes callback activation/action delivery while App is mutably borrowed,
 disabled accessibility, and native control tests in the next patch. Touched
 Rust files pass rustfmt and git diff --check. Windows native library tests are
-run by the branch CI; real Windows settings/RDP acceptance is pending because
-no interactive Windows execution endpoint is available.
+configured in the branch CI, but dispatch returned HTTP 422 because Actions
+is disabled for this fork. Those tests and real Windows settings/RDP
+acceptance remain unverified; no interactive Windows endpoint is available.
 
 ## Current fixed upstream sync (2026-11-03)
 
