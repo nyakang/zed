@@ -1287,6 +1287,9 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// Published by window updates, read by synchronous native hit testing
+    /// without borrowing App again while an input callback is running.
+    window_control_hit_test: Rc<Cell<Option<WindowControlArea>>>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2291,27 +2294,10 @@ impl Window {
                     .log_err();
             })
         });
+        let window_control_hit_test = Rc::new(Cell::new(None));
         platform_window.on_hit_test_window_control({
-            let mut cx = cx.to_async();
-            Box::new(move || {
-                handle
-                    .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
-                        }
-                        None
-                    })
-                    .with_context(|| {
-                        format!(
-                            "hit-testing window controls for window {:?}",
-                            handle.window_id()
-                        )
-                    })
-                    .log_err()
-                    .unwrap_or(None)
-            })
+            let hit_test = window_control_hit_test.clone();
+            Box::new(move || hit_test.get())
         });
         platform_window.on_move_tab_to_new_window({
             let mut cx = cx.to_async();
@@ -2432,6 +2418,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            window_control_hit_test,
             modifiers,
             capslock,
             scale_factor,
@@ -3793,6 +3780,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.publish_window_control_hit_test(&self.mouse_hit_test);
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -6494,7 +6482,20 @@ impl Window {
         });
     }
 
+    fn publish_window_control_hit_test(&self, hit_test: &HitTest) {
+        self.window_control_hit_test.set(
+            self.rendered_frame
+                .window_control_hitboxes
+                .iter()
+                .find_map(|(area, hitbox)| hit_test.ids.contains(&hitbox.id).then_some(*area)),
+        );
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        // An outside-press callback or a cursor change can synchronously send
+        // WM_NCHITTEST. Publish against the completed frame before either call.
+        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        self.publish_window_control_hit_test(&hit_test);
         if self.native_child_surface_mode
             && let Some(event) = event.downcast_ref::<MouseDownEvent>()
         {
@@ -6513,6 +6514,7 @@ impl Window {
             }
         }
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        self.publish_window_control_hit_test(&hit_test);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -8528,6 +8530,7 @@ mod dynamic_texture_allocation_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::prelude::FluentBuilder as _;
     use std::{
         cell::{Cell, RefCell},
         path::PathBuf,
@@ -8543,8 +8546,8 @@ mod tests {
         MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
         PointerCancelEvent, PointerCancelReason, Render, RequestFrameOptions, ScaledPixels,
         StatefulInteractiveElement as _, Styled, TestAppContext, ThermalState, TouchDragEvent,
-        TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
-        WindowOptions, canvas, div, hsla, point, px, size,
+        TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, VisualTestContext, Window,
+        WindowAppearance, WindowControlArea, WindowOptions, canvas, div, hsla, point, px, size,
     };
 
     #[gpui::test]
@@ -8647,6 +8650,171 @@ mod tests {
         }
         cx.run_until_parked();
         assert!(!cx.app.borrow().windows.contains_key(window.window_id()));
+    }
+
+    #[gpui::test]
+    fn window_control_hit_testing_is_reentrant_and_tracks_completed_layout(
+        cx: &mut TestAppContext,
+    ) {
+        struct Controls {
+            shifted: bool,
+            occluded: bool,
+        }
+        impl Render for Controls {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(if self.shifted { 200. } else { 0. }))
+                            .flex()
+                            .h(px(40.))
+                            .children(
+                                [
+                                    WindowControlArea::Drag,
+                                    WindowControlArea::Close,
+                                    WindowControlArea::Max,
+                                    WindowControlArea::Min,
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, area)| {
+                                    div()
+                                        .id(index)
+                                        .w(px(40.))
+                                        .h_full()
+                                        .window_control_area(area)
+                                }),
+                            ),
+                    )
+                    .when(self.occluded, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w(px(160.))
+                                .h(px(40.))
+                                .occlude(),
+                        )
+                    })
+            }
+        }
+        let (controls, cx) = cx.add_window_view(|_, _| Controls {
+            shifted: false,
+            occluded: false,
+        });
+        let platform_window =
+            cx.update(|window, _| window.platform_window.as_test().unwrap().clone());
+        assert_eq!(
+            platform_window.hit_test_window_control(),
+            Some(WindowControlArea::Drag)
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (x, expected) in [
+            (20., Some(WindowControlArea::Drag)),
+            (60., Some(WindowControlArea::Close)),
+            (100., Some(WindowControlArea::Max)),
+            (140., Some(WindowControlArea::Min)),
+            (180., None),
+        ] {
+            cx.simulate_mouse_move(point(px(x), px(20.)), MouseButton::Left, Default::default());
+            let _app = cx.cx.app.borrow_mut();
+            assert_eq!(platform_window.hit_test_window_control(), expected);
+        }
+        cx.simulate_mouse_move(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        controls.update(cx, |controls, cx| {
+            controls.shifted = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(platform_window.hit_test_window_control(), None);
+        cx.simulate_mouse_move(
+            point(px(220.), px(20.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        assert_eq!(
+            platform_window.hit_test_window_control(),
+            Some(WindowControlArea::Drag)
+        );
+        controls.update(cx, |controls, cx| {
+            controls.shifted = false;
+            controls.occluded = true;
+            cx.notify();
+        });
+        cx.simulate_mouse_move(
+            point(px(20.), px(20.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(platform_window.hit_test_window_control(), None);
+        controls.update(cx, |controls, cx| {
+            controls.occluded = false;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            platform_window.hit_test_window_control(),
+            Some(WindowControlArea::Drag)
+        );
+    }
+
+    #[gpui::test]
+    fn test_accessibility_client_uses_platform_callbacks_without_borrowing_app(
+        cx: &mut TestAppContext,
+    ) {
+        struct FocusView(FocusHandle);
+        impl Render for FocusView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("accessible-button")
+                    .role(crate::Role::Button)
+                    .track_focus(&self.0)
+                    .size_full()
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, cx| FocusView(cx.focus_handle()));
+        let platform_window =
+            cx.update(|window, _| window.platform_window.as_test().unwrap().clone());
+        {
+            let _app = cx.cx.app.borrow_mut();
+            assert!(platform_window.activate_accessibility());
+        }
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.is_a11y_active());
+            let target_node = *window.a11y.focus_ids.keys().next().expect("focusable node");
+            platform_window.simulate_accessibility_action(accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node,
+                data: None,
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(view.read(cx).0.is_focused(window));
+            window.draw(cx).clear(cx);
+            assert!(window.debug_a11y_tree_json().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn test_accessibility_client_respects_disabled_accessibility(cx: &mut TestAppContext) {
+        cx.disable_accessibility();
+        let window = cx.add_window(|_, _| EmptyView);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        assert!(!cx.activate_accessibility());
+        cx.update(|window, _| assert!(!window.is_a11y_active()));
     }
 
     #[cfg(feature = "profiler")]

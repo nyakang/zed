@@ -1,5 +1,24 @@
 # NyaTerm fork notes
 
+## 2026-11-06 reentrant native window-control hit testing
+
+Publish the current `WindowControlArea` through a window-owned
+`Rc<Cell<Option<WindowControlArea>>>`. The synchronous native callback only
+reads this projection, rather than trying to borrow App again during input
+handling. Mouse dispatch publishes before outside-press and cursor callbacks;
+completed frame swaps republish against their own hitboxes. Preserve the
+existing first-match ordering and occlusion behavior, with `None` before any
+frame has been produced. No platform callback signature changes.
+
+Validation: Linux GPUI library suite in the consuming-dependency workspace:
+446 passed, zero failures, two ignored. The regression invokes native control
+hit testing while App is already mutably borrowed, covers Drag/Close/Max/Min
+and ordinary content, and checks control movement and occlusion changes
+without pointer movement. The new platform accessibility tests also pass.
+Touched-file rustfmt and git diff --check pass. Windows backend and GPUI tests
+are covered by the branch CI; real Windows titlebar/settings/native RDP
+acceptance remains pending because no Windows execution endpoint is available.
+
 ## 2026-11-06 platform accessibility regression support
 
 Test windows retain the normal accessibility callbacks, invoked outside the
