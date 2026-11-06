@@ -23,6 +23,12 @@ execution endpoint is available.
 
 ## 2026-11-06 platform accessibility regression support
 
+Limit the client-activation regressions to native targets, matching the
+test-context helpers' non-wasm API boundary. This changes only test selection;
+the native regression path and production behavior stay the same.
+Validation after the guard: both native accessibility-client tests passed;
+touched-file rustfmt and `git diff --check` passed.
+
 Test windows retain the normal accessibility callbacks, invoked outside the
 window lock. `VisualTestContext::activate_accessibility() -> bool` connects a
 simulated client and draws the real tree;
