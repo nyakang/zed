@@ -45,6 +45,11 @@ jobs:
       - name: Check the WGPU and Linux backends
         run: cargo check -p gpui_wgpu -p gpui_linux
 
+      - name: Owned upload lifetime and batch validation
+        run: |
+          cargo test -p gpui_wgpu --lib owned_upload_tests
+          cargo test -p gpui --lib --features test-support owned_updates_validate
+
   # The Metal and DirectX atlases carry the same stride-aware upload and cannot
   # be compiled on Linux, so they are checked on their own platforms. Only
   # `cargo check` here: this branch is about those two files compiling, not
@@ -69,6 +74,9 @@ jobs:
 
       - name: Scheduler lifecycle tests
         run: cargo test -p scheduler --locked
+
+      - name: Owned texture interface regression
+        run: cargo test -p gpui --lib --features test-support owned_updates_validate
 
       - name: Native file promise delegate test
         if: runner.os == 'macOS'

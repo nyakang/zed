@@ -965,3 +965,13 @@ refactor. NyaTerm native X11 1080p and 4K full-frame owned/borrowed probes
 passed BGRA channel-order readback on Mesa llvmpipe; 1080p column uploads
 preserved surrounding pixels. This software adapter is not hardware GPU or
 physical-display acceptance. Wayland runtime, Windows and Metal remain pending.
+
+## 2026-11-19 owned-upload regression jobs
+
+Add WGPU owned-buffer lifetime/batch checks on Linux and the shared owned
+texture validation test on Linux, Windows and macOS to the branch workflow.
+Local scoped Linux validation additionally passed all 54 gpui_linux tests,
+WGPU lib/test clippy, and all eight X11 1080p/4K full/column owned/borrowed
+readback fixtures on Mesa llvmpipe. GPUI lib tests earlier passed 484 with
+two ignored; WGPU tests passed 49 after readback factoring. Hosted/native
+Windows/Metal, Wayland presentation and hardware GPUs remain unverified.
