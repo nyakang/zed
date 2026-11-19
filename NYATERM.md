@@ -951,3 +951,17 @@ NyaTerm desktop and native-probe compilation passed with local fork patches.
 Touched-file rustfmt and git diff --check passed. Native X11 rendered the
 probe, but pixel readback is unavailable in the baseline Linux window backend.
 Windows/Metal and physical display latency are unverified.
+
+## 2026-11-19 Linux window readback for native probes
+
+Forward test-support through gpui_platform to the Linux and WGPU crates. Add
+X11/Wayland window readback using the existing window renderer core, atlas
+and pipelines; reuse the bounded padded-row GPU copy routine with headless
+rendering. The readback path is test-support-only and does not run in normal
+application rendering.
+
+Linux, Rust 1.99.1: all 49 WGPU library tests pass after the shared readback
+refactor. NyaTerm native X11 1080p and 4K full-frame owned/borrowed probes
+passed BGRA channel-order readback on Mesa llvmpipe; 1080p column uploads
+preserved surrounding pixels. This software adapter is not hardware GPU or
+physical-display acceptance. Wayland runtime, Windows and Metal remain pending.

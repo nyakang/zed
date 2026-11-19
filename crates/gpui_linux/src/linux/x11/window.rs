@@ -1892,6 +1892,17 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("X11 window renderer was released"))?
+            .render_to_image(scene)
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0
             .state
