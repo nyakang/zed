@@ -1878,6 +1878,20 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+/// Shared immutable upload storage; custom owners can retain allocation leases.
+pub type OwnedTextureBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// One validated subregion in an owned dynamic-texture upload batch.
+#[derive(Clone)]
+pub struct DynamicTextureUpdate {
+    /// Destination relative to the dynamic texture.
+    pub bounds: Bounds<DevicePixels>,
+    /// Immutable bytes retained through deferred platform submission.
+    pub bytes: OwnedTextureBytes,
+    /// Source stride, including any padding.
+    pub bytes_per_row: u32,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     /// True when the backend implements planar-video sprite sampling.
@@ -1891,6 +1905,29 @@ pub trait PlatformAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    fn get_or_insert_owned(
+        &self,
+        key: AtlasKey,
+        size: Size<DevicePixels>,
+        bytes: OwnedTextureBytes,
+    ) -> Result<Option<AtlasTile>> {
+        self.get_or_insert_with(key, &mut || {
+            Ok(Some((size, Cow::Borrowed(bytes.as_ref().as_ref()))))
+        })
+    }
+
+    fn update_owned_batch(&self, key: &AtlasKey, updates: Vec<DynamicTextureUpdate>) -> Result<()> {
+        for update in updates {
+            self.update(
+                key,
+                update.bounds,
+                update.bytes.as_ref().as_ref(),
+                update.bytes_per_row,
+            )?;
+        }
+        Ok(())
+    }
+
     fn remove(&self, key: &AtlasKey);
     fn update(
         &self,
@@ -1914,6 +1951,15 @@ pub trait AtlasBackend {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> Result<AtlasTile>;
+
+    fn insert_owned(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+        bytes: OwnedTextureBytes,
+    ) -> Result<AtlasTile> {
+        self.insert(kind, size, bytes.as_ref().as_ref())
+    }
 
     fn remove(&mut self, tile: AtlasTile);
 }
@@ -1968,6 +2014,24 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
                 let tile = self
                     .backend
                     .insert(entry.key().texture_kind(), size, &bytes)?;
+                entry.insert(tile);
+                Ok(Some(tile))
+            }
+        }
+    }
+
+    pub fn get_or_insert_owned(
+        &mut self,
+        key: AtlasKey,
+        size: Size<DevicePixels>,
+        bytes: OwnedTextureBytes,
+    ) -> Result<Option<AtlasTile>> {
+        match self.tiles_by_key.entry(key) {
+            Entry::Occupied(entry) => Ok(Some(*entry.get())),
+            Entry::Vacant(entry) => {
+                let tile = self
+                    .backend
+                    .insert_owned(entry.key().texture_kind(), size, bytes)?;
                 entry.insert(tile);
                 Ok(Some(tile))
             }

@@ -11,21 +11,22 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DynamicTexture, DynamicTextureId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintedPath, Path,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DynamicTexture,
+    DynamicTextureId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, PaintedPath, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, SpriteAnimation, SpriteAnimationId,
+    StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -5847,9 +5848,6 @@ impl Window {
         bytes: &[u8],
         bytes_per_row: u32,
     ) -> Result<DynamicTexture> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static NEXT_DYNAMIC_TEXTURE_ID: AtomicUsize = AtomicUsize::new(0);
         let row_bytes = usize::try_from(size.width.0.max(0))?
             .checked_mul(4)
             .context("dynamic texture row size overflow")?;
@@ -5869,7 +5867,7 @@ impl Window {
         }
         let packed = dynamic_texture_bytes(bytes, row_bytes, height, source_stride)?;
         let texture = DynamicTexture {
-            id: DynamicTextureId(NEXT_DYNAMIC_TEXTURE_ID.fetch_add(1, Ordering::Relaxed)),
+            id: next_dynamic_texture_id(),
             size,
         };
         self.sprite_atlas
@@ -5878,6 +5876,45 @@ impl Window {
             })?
             .context("failed to allocate dynamic texture")?;
         Ok(texture)
+    }
+
+    /// Allocates a packed BGRA8 texture without copying an owned CPU payload.
+    pub fn create_dynamic_texture_owned(
+        &mut self,
+        size: Size<DevicePixels>,
+        bytes: crate::OwnedTextureBytes,
+    ) -> Result<DynamicTexture> {
+        let bounds = Bounds::new(Point::default(), size);
+        let stride = u32::try_from(size.width.0)?
+            .checked_mul(4)
+            .context("texture row overflow")?;
+        validate_owned_texture_update(size, bounds, bytes.as_ref().as_ref(), stride)?;
+        let texture = DynamicTexture {
+            id: next_dynamic_texture_id(),
+            size,
+        };
+        self.sprite_atlas
+            .get_or_insert_owned(crate::AtlasKey::DynamicTexture(texture.id), size, bytes)?
+            .context("failed to allocate dynamic texture")?;
+        Ok(texture)
+    }
+
+    /// Validates the entire batch before handing owned pixels to the atlas.
+    pub fn update_dynamic_texture_owned_batch(
+        &mut self,
+        texture: DynamicTexture,
+        updates: Vec<crate::DynamicTextureUpdate>,
+    ) -> Result<()> {
+        for update in &updates {
+            validate_owned_texture_update(
+                texture.size,
+                update.bounds,
+                update.bytes.as_ref().as_ref(),
+                update.bytes_per_row,
+            )?;
+        }
+        self.sprite_atlas
+            .update_owned_batch(&crate::AtlasKey::DynamicTexture(texture.id), updates)
     }
 
     /// Uploads a BGRA8 sub-region into a mutable texture.
@@ -8779,8 +8816,46 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
     }
 }
 
-/// Atlas insertion consumes bytes synchronously. Keep ordinary framebuffers
-/// borrowed and allocate only when source rows contain padding.
+fn next_dynamic_texture_id() -> DynamicTextureId {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    DynamicTextureId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+fn validate_owned_texture_update(
+    size: Size<DevicePixels>,
+    bounds: Bounds<DevicePixels>,
+    bytes: &[u8],
+    stride: u32,
+) -> Result<()> {
+    let x = bounds.origin.x.0;
+    let y = bounds.origin.y.0;
+    let width = bounds.size.width.0;
+    let height = bounds.size.height.0;
+    anyhow::ensure!(
+        x >= 0
+            && y >= 0
+            && width > 0
+            && height > 0
+            && x.checked_add(width).is_some_and(|v| v <= size.width.0)
+            && y.checked_add(height).is_some_and(|v| v <= size.height.0),
+        "invalid owned texture bounds"
+    );
+    let row = usize::try_from(width)?
+        .checked_mul(4)
+        .context("texture row overflow")?;
+    anyhow::ensure!(stride as usize >= row, "invalid owned texture stride");
+    let required = (usize::try_from(height)? - 1)
+        .checked_mul(stride as usize)
+        .and_then(|v| v.checked_add(row))
+        .context("texture payload overflow")?;
+    anyhow::ensure!(
+        bytes.len() == required,
+        "invalid owned texture payload length"
+    );
+    Ok(())
+}
+
+/// Keep ordinary framebuffers borrowed; allocate only when source rows contain padding.
 fn dynamic_texture_bytes(
     bytes: &[u8],
     row_bytes: usize,
@@ -8814,7 +8889,8 @@ fn dynamic_texture_bytes(
 
 #[cfg(test)]
 mod dynamic_texture_allocation_tests {
-    use super::dynamic_texture_bytes;
+    use super::{dynamic_texture_bytes, validate_owned_texture_update};
+    use crate::{Bounds, DevicePixels, point, size};
     use std::borrow::Cow;
 
     #[test]
@@ -8839,6 +8915,26 @@ mod dynamic_texture_allocation_tests {
         assert!(dynamic_texture_bytes(&[], 4, 0, 4).is_err());
         assert!(dynamic_texture_bytes(&[0; 4], 4, 2, 4).is_err());
         assert!(dynamic_texture_bytes(&[], usize::MAX, 2, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn owned_updates_validate_bounds_stride_and_exact_payload_before_dispatch() {
+        let dimensions = size(DevicePixels(4), DevicePixels(4));
+        let bounds = Bounds::new(
+            point(DevicePixels(1), DevicePixels(1)),
+            size(DevicePixels(2), DevicePixels(2)),
+        );
+        assert!(validate_owned_texture_update(dimensions, bounds, &[0; 16], 8).is_ok());
+        assert!(validate_owned_texture_update(dimensions, bounds, &[0; 20], 12).is_ok());
+        assert!(validate_owned_texture_update(dimensions, bounds, &[0; 16], 4).is_err());
+        assert!(validate_owned_texture_update(dimensions, bounds, &[0; 15], 8).is_err());
+        assert!(validate_owned_texture_update(dimensions, bounds, &[0; 17], 8).is_err());
+        let outside = Bounds::new(point(DevicePixels(3), DevicePixels(1)), bounds.size);
+        assert!(validate_owned_texture_update(dimensions, outside, &[0; 16], 8).is_err());
+        let negative = Bounds::new(point(DevicePixels(-1), DevicePixels(1)), bounds.size);
+        assert!(validate_owned_texture_update(dimensions, negative, &[0; 16], 8).is_err());
+        let overflow = Bounds::new(point(DevicePixels(i32::MAX), DevicePixels(0)), bounds.size);
+        assert!(validate_owned_texture_update(dimensions, overflow, &[0; 16], 8).is_err());
     }
 }
 

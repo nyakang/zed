@@ -934,3 +934,20 @@ while existing content streams keep the STA alive independently of the current
 data-object generation. Count live streams explicitly rather than inferring
 ownership from Arc counts. Validation: all 16 Windows external_drag_tests passed,
 including replacement during an open stream; existing drag tests remain green.
+
+## 2026-11-19 owned dynamic texture uploads
+
+Add owned packed BGRA insertion and validated dynamic-texture batch updates.
+Native synchronous atlases borrow the owner for the call. WGPU retains the
+original BGRA allocation until submission/removal and takes one atlas lock
+per batch; RGBA-only formats retain the swizzle fallback. Validate every
+update before dispatch so malformed batches cannot submit a valid prefix.
+Existing borrowed APIs and shared dynamic-texture identity remain compatible.
+
+Linux, Rust 1.99.1: GPUI tests in a scoped source-copy validation workspace
+passed (484 passed, two ignored); WGPU library tests passed (49). Tests cover
+owner identity/lifetime, removal before upload and invalid-batch atomicity.
+NyaTerm desktop and native-probe compilation passed with local fork patches.
+Touched-file rustfmt and git diff --check passed. Native X11 rendered the
+probe, but pixel readback is unavailable in the baseline Linux window backend.
+Windows/Metal and physical display latency are unverified.

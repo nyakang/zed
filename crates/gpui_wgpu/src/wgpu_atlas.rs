@@ -2,7 +2,8 @@ use anyhow::{Context as _, Result};
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    AtlasTile, Bounds, DevicePixels, DynamicTextureUpdate, OwnedTextureBytes, PlatformAtlas, Point,
+    Size,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -25,7 +26,7 @@ pub struct WgpuAtlas(Mutex<AtlasState<WgpuAtlasTextures>>);
 struct PendingUpload {
     id: AtlasTextureId,
     bounds: Bounds<DevicePixels>,
-    data: Vec<u8>,
+    data: OwnedTextureBytes,
     bytes_per_row: u32,
 }
 
@@ -124,6 +125,45 @@ impl PlatformAtlas for WgpuAtlas {
         self.0.lock().get_or_insert_with(key, build)
     }
 
+    fn get_or_insert_owned(
+        &self,
+        key: AtlasKey,
+        size: Size<DevicePixels>,
+        bytes: OwnedTextureBytes,
+    ) -> Result<Option<AtlasTile>> {
+        self.0.lock().get_or_insert_owned(key, size, bytes)
+    }
+
+    fn update_owned_batch(&self, key: &AtlasKey, updates: Vec<DynamicTextureUpdate>) -> Result<()> {
+        let mut lock = self.0.lock();
+        let tile = lock.tile(key).context("atlas tile was not found")?;
+        for update in &updates {
+            validate_update(
+                tile,
+                update.bounds,
+                update.bytes.as_ref().as_ref(),
+                update.bytes_per_row,
+            )?;
+        }
+        lock.backend
+            .pending_uploads
+            .try_reserve(updates.len())
+            .context("failed to allocate upload queue")?;
+        for update in updates {
+            let absolute = Bounds {
+                origin: tile.bounds.origin + update.bounds.origin,
+                size: update.bounds.size,
+            };
+            lock.backend.upload_owned_with_stride(
+                tile.texture_id,
+                absolute,
+                update.bytes,
+                update.bytes_per_row,
+            )?;
+        }
+        Ok(())
+    }
+
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
     }
@@ -157,6 +197,25 @@ impl AtlasBackend for WgpuAtlasTextures {
     ) -> Result<AtlasTile> {
         let tile = self.allocate(size, kind).context("failed to allocate")?;
         if let Err(error) = self.upload_texture(tile.texture_id, tile.bounds, bytes) {
+            self.remove(tile);
+            return Err(error);
+        }
+        Ok(tile)
+    }
+
+    fn insert_owned(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+        bytes: OwnedTextureBytes,
+    ) -> Result<AtlasTile> {
+        let tile = self.allocate(size, kind).context("failed to allocate")?;
+        if let Err(error) = self.upload_owned_with_stride(
+            tile.texture_id,
+            tile.bounds,
+            bytes,
+            size.width.0 as u32 * 4,
+        ) {
             self.remove(tile);
             return Err(error);
         }
@@ -323,6 +382,36 @@ impl WgpuAtlasTextures {
         self.pending_uploads.push(PendingUpload {
             id,
             bounds,
+            data: Arc::new(data),
+            bytes_per_row,
+        });
+        Ok(())
+    }
+
+    fn upload_owned_with_stride(
+        &mut self,
+        id: AtlasTextureId,
+        bounds: Bounds<DevicePixels>,
+        bytes: OwnedTextureBytes,
+        bytes_per_row: u32,
+    ) -> Result<()> {
+        let format = self
+            .storage
+            .get(id)
+            .context("atlas texture was removed")?
+            .format;
+        // BGRA owners pass through unchanged. RGBA-only devices need a swizzled allocation.
+        let data = if format == wgpu::TextureFormat::Rgba8Unorm {
+            Arc::new(swizzle_upload_data(bytes.as_ref().as_ref(), format)?) as OwnedTextureBytes
+        } else {
+            bytes
+        };
+        self.pending_uploads
+            .try_reserve(1)
+            .context("failed to allocate upload queue")?;
+        self.pending_uploads.push(PendingUpload {
+            id,
+            bounds,
             data,
             bytes_per_row,
         });
@@ -345,7 +434,7 @@ impl WgpuAtlasTextures {
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &upload.data,
+                upload.data.as_ref().as_ref(),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(upload.bytes_per_row),
@@ -507,7 +596,7 @@ mod tests {
     use gpui::{ImageId, RenderImageParams};
     use std::sync::Arc;
 
-    fn test_device_and_queue() -> anyhow::Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+    pub(super) fn test_device_and_queue() -> anyhow::Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
         block_on(async {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
@@ -726,4 +815,120 @@ fn allocation_scope_succeeded(scope: wgpu::ErrorScopeGuard) -> bool {
             .poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(None)
     )
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod owned_upload_tests {
+    use super::{WgpuAtlas, tests::test_device_and_queue};
+    use gpui::{
+        AtlasKey, Bounds, DevicePixels, DynamicTextureId, DynamicTextureUpdate, OwnedTextureBytes,
+        PlatformAtlas, point, size,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Pixels {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl AsRef<[u8]> for Pixels {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    impl Drop for Pixels {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn owned_bgra_upload_keeps_the_original_allocation_until_submit_and_releases_on_remove()
+    -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = AtlasKey::DynamicTexture(DynamicTextureId(9000));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let pixels = Pixels {
+            bytes: vec![0, 0, 0, 255],
+            drops: drops.clone(),
+        };
+        let pointer = pixels.bytes.as_ptr();
+        atlas.get_or_insert_owned(
+            key.clone(),
+            size(DevicePixels(1), DevicePixels(1)),
+            Arc::new(pixels),
+        )?;
+        assert_eq!(
+            atlas.0.lock().backend.pending_uploads[0]
+                .data
+                .as_ref()
+                .as_ref()
+                .as_ptr(),
+            pointer
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        atlas.before_frame();
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        let owned: OwnedTextureBytes = Arc::new(Pixels {
+            bytes: vec![1, 2, 3, 255],
+            drops: drops.clone(),
+        });
+        atlas.update_owned_batch(
+            &key,
+            vec![DynamicTextureUpdate {
+                bounds: Bounds::new(
+                    point(DevicePixels(0), DevicePixels(0)),
+                    size(DevicePixels(1), DevicePixels(1)),
+                ),
+                bytes: owned,
+                bytes_per_row: 4,
+            }],
+        )?;
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        atlas.remove(&key);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        atlas.before_frame();
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_owned_batch_does_not_enqueue_a_valid_prefix() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = AtlasKey::DynamicTexture(DynamicTextureId(9001));
+        atlas.get_or_insert_owned(
+            key.clone(),
+            size(DevicePixels(2), DevicePixels(2)),
+            Arc::new(vec![0; 16]),
+        )?;
+        atlas.before_frame();
+        let region = Bounds::new(
+            point(DevicePixels(0), DevicePixels(0)),
+            size(DevicePixels(1), DevicePixels(1)),
+        );
+        assert!(
+            atlas
+                .update_owned_batch(
+                    &key,
+                    vec![
+                        DynamicTextureUpdate {
+                            bounds: region,
+                            bytes: Arc::new(vec![0; 4]),
+                            bytes_per_row: 4
+                        },
+                        DynamicTextureUpdate {
+                            bounds: region,
+                            bytes: Arc::new(vec![0; 3]),
+                            bytes_per_row: 4
+                        },
+                    ]
+                )
+                .is_err()
+        );
+        assert!(atlas.0.lock().backend.pending_uploads.is_empty());
+        Ok(())
+    }
 }
