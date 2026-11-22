@@ -975,3 +975,11 @@ WGPU lib/test clippy, and all eight X11 1080p/4K full/column owned/borrowed
 readback fixtures on Mesa llvmpipe. GPUI lib tests earlier passed 484 with
 two ignored; WGPU tests passed 49 after readback factoring. Hosted/native
 Windows/Metal, Wayland presentation and hardware GPUs remain unverified.
+
+## 2026-11-23 atlas benchmark video metadata
+
+Initialize the four video metadata fields in the BGRA atlas benchmark's
+PolychromeSprite fixture. The earlier planar-video change added these required
+fields but left this all-targets benchmark initializer behind. Zero selects the
+existing BGRA path. Validation: scoped Linux script/clippy with gpui_platform
+and gpui_linux, all targets and features.

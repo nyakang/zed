@@ -245,6 +245,10 @@ fn tile_scene(tile: AtlasTile) -> Scene {
             bounds,
             content_mask,
             corner_radii: Corners::default(),
+            video_height: 0,
+            video_matrix: 0,
+            video_full_range: 0,
+            video_pad: 0,
         }),
         AtlasTextureKind::Subpixel => unreachable!(),
     }
