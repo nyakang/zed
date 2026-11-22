@@ -510,6 +510,29 @@ impl InputEvent for MouseMoveEvent {
 }
 impl MouseEvent for MouseMoveEvent {}
 
+/// Relative motion while the operating system has locked the pointer, or a
+/// notification that a compositor granted or revoked a pending lock.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PointerLockEvent {
+    /// Motion in device-relative units, independent of the bounded cursor position.
+    Motion {
+        /// Signed relative device motion; applications must not clamp to window bounds.
+        delta: Point<f32>,
+    },
+    /// An asynchronous pointer-lock request was granted.
+    Locked,
+    /// The operating system revoked the lock. Applications must release held inputs.
+    Unlocked,
+}
+
+impl Sealed for PointerLockEvent {}
+impl InputEvent for PointerLockEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::PointerLock(self)
+    }
+}
+impl MouseEvent for PointerLockEvent {}
+
 impl MouseMoveEvent {
     /// Returns true if the left mouse button is currently held down.
     pub fn dragging(&self) -> bool {
@@ -834,6 +857,8 @@ pub enum PlatformInput {
     MousePressure(MousePressureEvent),
     /// The mouse was moved.
     MouseMove(MouseMoveEvent),
+    /// Relative pointer motion and asynchronous lock state changes.
+    PointerLock(PointerLockEvent),
     /// The mouse exited the window.
     MouseExited(MouseExitEvent),
     /// The pointer gesture was cancelled without a mouse-up or drop.
@@ -864,6 +889,7 @@ impl PlatformInput {
             PlatformInput::MouseDown(event) => Some(event),
             PlatformInput::MouseUp(event) => Some(event),
             PlatformInput::MouseMove(event) => Some(event),
+            PlatformInput::PointerLock(event) => Some(event),
             PlatformInput::MousePressure(event) => Some(event),
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::PointerCancelled(event) => Some(event),
@@ -885,6 +911,7 @@ impl PlatformInput {
             PlatformInput::MouseDown(_) => None,
             PlatformInput::MouseUp(_) => None,
             PlatformInput::MouseMove(_) => None,
+            PlatformInput::PointerLock(_) => None,
             PlatformInput::MousePressure(_) => None,
             PlatformInput::MouseExited(_) => None,
             PlatformInput::PointerCancelled(_) => None,
@@ -909,6 +936,7 @@ impl PlatformInput {
             PlatformInput::MouseUp(_) => "mouse_up",
             PlatformInput::MousePressure(_) => "mouse_pressure",
             PlatformInput::MouseMove(_) => "mouse_move",
+            PlatformInput::PointerLock(_) => "pointer_lock",
             PlatformInput::MouseExited(_) => "mouse_exited",
             PlatformInput::PointerCancelled(_) => "pointer_cancelled",
             PlatformInput::Scroll(_) => "scroll",

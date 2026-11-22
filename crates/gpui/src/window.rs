@@ -3754,6 +3754,20 @@ impl Window {
         self.mouse_position
     }
 
+    /// Request OS pointer locking for an explicit user interaction. While locked,
+    /// listen for [`crate::PointerLockEvent`] through [`Self::on_mouse_event`].
+    /// The OS releases on window deactivation; callers must also release when the
+    /// owning view disappears or the user invokes their documented escape action.
+    /// On Wayland, success means the compositor accepted a pending request.
+    pub fn set_pointer_lock(&mut self, enabled: bool) -> Result<()> {
+        self.platform_window.set_pointer_lock(enabled)
+    }
+
+    /// Whether the OS has granted the pointer lock, including asynchronous grants.
+    pub fn is_pointer_locked(&self) -> bool {
+        self.platform_window.is_pointer_locked()
+    }
+
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
     /// events will be routed to listeners that check this hitbox's `is_hovered` status,
     /// regardless of actual hit testing. This enables drag operations that continue
@@ -6465,7 +6479,9 @@ impl Window {
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::PointerLock(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -6486,6 +6502,7 @@ impl Window {
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
+            PlatformInput::PointerLock(event) => PlatformInput::PointerLock(event),
             PlatformInput::MouseDown(mouse_down) => {
                 // A new press cannot continue a gesture whose capture ended in
                 // another window before its deferred cancellation was delivered.

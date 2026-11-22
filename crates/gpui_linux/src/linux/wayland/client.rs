@@ -1,3 +1,5 @@
+mod pointer_lock;
+
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
@@ -44,6 +46,7 @@ use wayland_client::{
 use wayland_protocols::ext::background_effect::v1::client::{
     ext_background_effect_manager_v1, ext_background_effect_surface_v1,
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1;
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -54,6 +57,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_source_v1,
 };
+use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_manager_v1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
     ContentHint, ContentPurpose,
 };
@@ -261,6 +265,9 @@ pub struct Globals {
         Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    pub pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
+    pub relative_pointer_manager:
+        Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
     pub executor: ForegroundExecutor,
@@ -312,6 +319,8 @@ impl Globals {
             background_effects_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
+            pointer_constraints: globals.bind(&qh, 1..=1, ()).ok(),
+            relative_pointer_manager: globals.bind(&qh, 1..=1, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
@@ -363,7 +372,9 @@ pub(crate) struct WaylandClientState {
     pub gpu_context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
+    seat_global_name: Option<u32>,
     wl_pointer: Option<wl_pointer::WlPointer>,
+    pointer_lock: Option<pointer_lock::PointerLock>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -832,7 +843,7 @@ impl WaylandClientState {
         let Some(wl_pointer) = self.wl_pointer.clone() else {
             return;
         };
-        if style == CursorStyle::Hidden {
+        if style == CursorStyle::Hidden || self.pointer_lock_active() {
             wl_pointer.set_cursor(serial, None, 0, 0);
             return;
         }
@@ -901,6 +912,7 @@ impl Drop for WaylandConnection {
 
         let mut state = self.0.borrow_mut();
         state.windows.clear();
+        state.pointer_lock.take();
 
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
@@ -1003,6 +1015,7 @@ impl WaylandConnection {
         let qh = event_queue.handle();
 
         let mut seat: Option<wl_seat::WlSeat> = None;
+        let mut seat_global_name = None;
         #[allow(clippy::mutable_key_type)]
         let mut in_progress_outputs = HashMap::default();
         #[allow(clippy::mutable_key_type)]
@@ -1013,6 +1026,7 @@ impl WaylandConnection {
             for global in list {
                 match &global.interface[..] {
                     "wl_seat" => {
+                        seat_global_name = Some(global.name);
                         seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
                             global.name,
                             wl_seat_version(global.version)?,
@@ -1072,7 +1086,9 @@ impl WaylandConnection {
             gpu_context,
             compositor_gpu,
             wl_seat: seat,
+            seat_global_name,
             wl_pointer: None,
+            pointer_lock: None,
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -1601,6 +1617,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         log::error!("ignoring wl_seat below the required version");
                         return;
                     };
+                    let unlocked_window = state.cancel_pointer_lock();
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
@@ -1609,6 +1626,13 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     }
                     state.wl_seat.release();
                     state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
+                    state.seat_global_name = Some(name);
+                    drop(state);
+                    if let Some(window) = unlocked_window {
+                        window.handle_input(PlatformInput::PointerLock(
+                            gpui::PointerLockEvent::Unlocked,
+                        ));
+                    }
                 }
                 "wl_output" => {
                     let Ok(version) = wl_output_version(version) else {
@@ -1626,6 +1650,23 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name } => {
+                if state.seat_global_name == Some(name) {
+                    state.seat_global_name = None;
+                    let unlocked_window = state.cancel_pointer_lock();
+                    if let Some(pointer) = state.wl_pointer.take() {
+                        pointer.release();
+                    }
+                    if let Some(keyboard) = state.wl_keyboard.take() {
+                        keyboard.release();
+                    }
+                    drop(state);
+                    if let Some(window) = unlocked_window {
+                        window.handle_input(PlatformInput::PointerLock(
+                            gpui::PointerLockEvent::Unlocked,
+                        ));
+                    }
+                    return;
+                }
                 let Some(id) = state.output_globals.remove(&name) else {
                     return;
                 };
@@ -1948,6 +1989,11 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
         {
             let client = state.get_client();
             let mut state = client.borrow_mut();
+            if *seat != state.wl_seat {
+                return;
+            }
+            // The native pointer/keyboard proxies below are replaced on capabilities updates.
+            let unlocked_window = state.cancel_pointer_lock();
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 let keyboard = seat.get_keyboard(qh, ());
 
@@ -1968,6 +2014,8 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
 
                 state.wl_keyboard = Some(keyboard);
+            } else if let Some(keyboard) = state.wl_keyboard.take() {
+                keyboard.release();
             }
             if capabilities.contains(wl_seat::Capability::Pointer) {
                 let pointer = seat.get_pointer(qh, ());
@@ -1993,6 +2041,12 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
 
                 state.wl_pointer = Some(pointer);
+            } else if let Some(pointer) = state.wl_pointer.take() {
+                pointer.release();
+            }
+            drop(state);
+            if let Some(window) = unlocked_window {
+                window.handle_input(PlatformInput::PointerLock(gpui::PointerLockEvent::Unlocked));
             }
         }
     }
@@ -2001,7 +2055,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        _: &wl_keyboard::WlKeyboard,
+        keyboard: &wl_keyboard::WlKeyboard,
         event: wl_keyboard::Event,
         _: &(),
         _: &Connection,
@@ -2009,6 +2063,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
     ) {
         let client = this.get_client();
         let mut state = client.borrow_mut();
+        if state.wl_keyboard.as_ref() != Some(keyboard) {
+            return;
+        }
         match event {
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 state.repeat.characters_per_second = rate as u32;
@@ -2060,6 +2117,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
+                let pointer_released = state.release_pointer_lock(&surface.id());
                 state.keyboard_focused_window = None;
                 state.enter_token.take();
                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
@@ -2072,6 +2130,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     }
                     state.pre_edit_text.take();
                     drop(state);
+                    if pointer_released {
+                        window.handle_input(PlatformInput::PointerLock(
+                            gpui::PointerLockEvent::Unlocked,
+                        ));
+                    }
                     window.handle_ime(ImeInput::DeleteText);
                     window.set_focused(false);
                 }
@@ -2349,7 +2412,7 @@ fn linux_button_to_gpui(button: u32) -> Option<MouseButton> {
 impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        wl_pointer: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -2357,6 +2420,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
     ) {
         let client = this.get_client();
         let mut state = client.borrow_mut();
+        if state.wl_pointer.as_ref() != Some(pointer) {
+            return;
+        }
 
         match event {
             wl_pointer::Event::Enter {
@@ -2394,6 +2460,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_pointer::Event::Leave { .. } => {
+                let unlocked_window = state.cancel_pointer_lock();
                 if let Some(focused_window) = state.mouse_focused_window.clone() {
                     let input = PlatformInput::MouseExited(MouseExitEvent {
                         position: state.mouse_location.unwrap(),
@@ -2406,8 +2473,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     state.cursor_hidden_window = None;
 
                     drop(state);
+                    if let Some(window) = unlocked_window {
+                        window.handle_input(PlatformInput::PointerLock(
+                            gpui::PointerLockEvent::Unlocked,
+                        ));
+                    }
                     focused_window.handle_input(input);
                     focused_window.set_hovered(false);
+                } else {
+                    drop(state);
+                    if let Some(window) = unlocked_window {
+                        window.handle_input(PlatformInput::PointerLock(
+                            gpui::PointerLockEvent::Unlocked,
+                        ));
+                    }
                 }
             }
             wl_pointer::Event::Motion {
@@ -2415,6 +2494,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 surface_y,
                 ..
             } => {
+                if state.pointer_lock_active() {
+                    return;
+                }
                 if state.mouse_focused_window.is_none() {
                     return;
                 }

@@ -774,6 +774,8 @@ pub enum ImeInput {
 
 impl Drop for WaylandWindow {
     fn drop(&mut self) {
+        use gpui_util::ResultExt as _;
+        self.set_pointer_lock(false).log_err();
         self.0.frame_loop.set(FrameLoop::Parked);
 
         let mut state = self.0.state.borrow_mut();
@@ -1745,6 +1747,21 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 }
 
 impl PlatformWindow for WaylandWindow {
+    fn set_pointer_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        let (client, surface) = {
+            let state = self.borrow();
+            (state.client.clone(), state.surface.clone())
+        };
+        client.set_pointer_lock(&surface, enabled)
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        let (client, surface) = {
+            let state = self.borrow();
+            (state.client.clone(), state.surface.id())
+        };
+        client.is_pointer_locked(&surface)
+    }
     fn bounds(&self) -> Bounds<Pixels> {
         self.borrow().bounds
     }

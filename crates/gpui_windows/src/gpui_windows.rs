@@ -19,6 +19,7 @@ mod modal_owner;
 mod native_cursor;
 mod native_overlay;
 mod platform;
+mod pointer_lock;
 mod system_notifications;
 mod system_settings;
 mod util;

@@ -304,6 +304,20 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(handle),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
+            WM_INPUT => {
+                let pointer_locked = self.state.pointer_lock.borrow().active();
+                if pointer_locked
+                    && let Some(delta) = crate::pointer_lock::relative_motion(lparam)
+                    && let Some(mut callback) = self.state.callbacks.input.take()
+                {
+                    callback(PlatformInput::PointerLock(PointerLockEvent::Motion {
+                        delta,
+                    }));
+                    self.state.callbacks.input.set(Some(callback));
+                }
+                // DefWindowProc must clean up foreground WM_INPUT allocations.
+                None
+            }
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
@@ -546,6 +560,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
+        if self.state.pointer_lock.borrow().active() {
+            return Some(0);
+        }
         self.start_tracking_mouse(handle, TME_LEAVE);
         self.restore_cursor_after_hide();
 
@@ -1116,6 +1133,12 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
+            let was_locked = this.state.pointer_lock.borrow().active();
+            this.state.pointer_lock.borrow_mut().release();
+            if was_locked && let Some(mut callback) = this.state.callbacks.input.take() {
+                callback(PlatformInput::PointerLock(PointerLockEvent::Unlocked));
+                this.state.callbacks.input.set(Some(callback));
+            }
             this.state.cursor_visible.store(true, Ordering::Relaxed);
         }
 
@@ -1500,6 +1523,10 @@ impl WindowsWindowInner {
     }
 
     fn handle_set_cursor(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        if self.state.pointer_lock.borrow().active() {
+            unsafe { SetCursor(None) };
+            return Some(1);
+        }
         let target = HWND(wparam.0 as _);
         if crate::native_cursor::native_child_owns_cursor(handle, target) {
             // DefWindowProc asks the parent before applying a child's cursor.

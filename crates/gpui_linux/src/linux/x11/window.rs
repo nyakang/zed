@@ -888,6 +888,7 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 
 impl Drop for X11Window {
     fn drop(&mut self) {
+        self.set_pointer_lock(false).log_err();
         let mut state = self.0.state.borrow_mut();
 
         if let Some(parent) = state.parent.as_ref() {
@@ -1425,6 +1426,15 @@ impl X11WindowStatePtr {
 }
 
 impl PlatformWindow for X11Window {
+    fn set_pointer_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        let client = self.0.state.borrow().client.clone();
+        client.set_pointer_lock(self.0.x_window, enabled)
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        let client = self.0.state.borrow().client.clone();
+        client.is_pointer_locked(self.0.x_window)
+    }
     fn can_start_external_drag(&self) -> bool {
         true
     }

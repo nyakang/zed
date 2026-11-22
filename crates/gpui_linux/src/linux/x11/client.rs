@@ -1,3 +1,5 @@
+mod pointer_lock;
+
 use anyhow::{Context as _, anyhow};
 use ashpd::WindowIdentifier;
 use calloop::{
@@ -230,6 +232,7 @@ pub struct X11ClientState {
     pub(crate) cursor_cache: HashMap<CursorStyle, Option<xproto::Cursor>>,
     pub(crate) invisible_cursor_cache: Option<xproto::Cursor>,
     pub(crate) cursor_hidden_window: Option<xproto::Window>,
+    pointer_lock: Option<pointer_lock::PointerLock>,
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
 
@@ -545,6 +548,7 @@ impl X11Connection {
                 cursor_styles: HashMap::default(),
                 cursor_cache: HashMap::default(),
                 cursor_hidden_window: None,
+                pointer_lock: None,
                 invisible_cursor_cache: None,
 
                 pointer_device_states,
@@ -1070,6 +1074,11 @@ impl X11Client {
             }
             Event::FocusOut(event) => {
                 let window = self.get_window(event.event)?;
+                let released = self.0.borrow_mut().release_pointer_lock(event.event);
+                if released {
+                    window
+                        .handle_input(PlatformInput::PointerLock(gpui::PointerLockEvent::Unlocked));
+                }
                 window.set_active(false);
                 let mut state = self.0.borrow_mut();
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
@@ -1239,6 +1248,7 @@ impl X11Client {
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
+                let position = state.pointer_lock_position(event.event).unwrap_or(position);
 
                 if state.composing && state.ximc.is_some() {
                     drop(state);
@@ -1317,6 +1327,7 @@ impl X11Client {
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
+                let position = state.pointer_lock_position(event.event).unwrap_or(position);
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
                         let click_count = state.current_count;
@@ -1330,6 +1341,16 @@ impl X11Client {
                     }
                     Some(ButtonOrScroll::Scroll(_)) => {}
                     None => {}
+                }
+            }
+            Event::XinputRawMotion(event) => {
+                let target = self.0.borrow().relative_pointer_event(&event);
+                if let Some((target, delta)) = target
+                    && let Some(window) = self.get_window(target)
+                {
+                    window.handle_input(PlatformInput::PointerLock(
+                        gpui::PointerLockEvent::Motion { delta },
+                    ));
                 }
             }
             Event::XinputMotion(event) => {
@@ -1368,11 +1389,13 @@ impl X11Client {
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
+                let locked_position = state.pointer_lock_position(event.event);
+                let position = locked_position.unwrap_or(position);
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 drop(state);
 
-                if event.valuator_mask[0] & 3 != 0 {
+                if locked_position.is_none() && event.valuator_mask[0] & 3 != 0 {
                     window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
                         position,
                         pressed_button,
@@ -1394,6 +1417,9 @@ impl X11Client {
                 }
             }
             Event::XinputEnter(event) if event.mode == xinput::NotifyMode::NORMAL => {
+                if self.0.borrow().pointer_lock.is_some() {
+                    return Some(());
+                }
                 let window = self.get_window(event.event)?;
                 window.set_hovered(true);
                 let mut state = self.0.borrow_mut();
@@ -1402,6 +1428,9 @@ impl X11Client {
             }
             Event::XinputLeave(event) if event.mode == xinput::NotifyMode::NORMAL => {
                 let mut state = self.0.borrow_mut();
+                if state.pointer_lock.is_some() {
+                    return Some(());
+                }
 
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
                 reset_all_pointer_device_scroll_positions(&mut state.pointer_device_states);
@@ -1425,6 +1454,7 @@ impl X11Client {
             }
             Event::XinputHierarchy(event) => {
                 let mut state = self.0.borrow_mut();
+                let unlocked_window = state.cancel_pointer_lock();
                 // Temporarily use `state.pointer_device_states` to only store pointers that still have valid scroll values.
                 // Any change to a device invalidates its scroll values.
                 for info in event.infos {
@@ -1437,6 +1467,11 @@ impl X11Client {
                     &state.pointer_device_states,
                 ) {
                     state.pointer_device_states = pointer_device_states;
+                }
+                drop(state);
+                if let Some(window) = unlocked_window.and_then(|window| self.get_window(window)) {
+                    window
+                        .handle_input(PlatformInput::PointerLock(gpui::PointerLockEvent::Unlocked));
                 }
             }
             Event::XinputDeviceChanged(event) => {

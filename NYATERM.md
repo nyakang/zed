@@ -983,3 +983,34 @@ PolychromeSprite fixture. The earlier planar-video change added these required
 fields but left this all-targets benchmark initializer behind. Zero selects the
 existing BGRA path. Validation: scoped Linux script/clippy with gpui_platform
 and gpui_linux, all targets and features.
+
+## 2026-11-23 native relative pointer locking
+
+Expose Window::set_pointer_lock/is_pointer_locked and PointerLockEvent without
+changing bounded mouse coordinates. Windows owns a raw-input registration and
+cursor constraint and restores only resources still owned by that window. X11
+uses XI2 raw motion/device grabs and restores its event-mask contribution.
+Wayland uses one-shot pointer constraints plus relative pointers, rejects stale
+proxies and cancels on focus, seat or capability loss. macOS pairs Quartz cursor
+disassociation/hiding with restoration on release, loss of key status and drop.
+Setters never synchronously invoke input callbacks. Acquisition is explicit;
+compositor revocation does not silently reacquire. TestWindow models ownership
+and deactivation for downstream lifecycle tests. Other backends reject acquisition.
+
+The gpui_platform pointer_lock example is a native acceptance probe: click its
+window to capture, Shift+F12 to release, and it exits after 30 seconds (optional
+first argument changes the timeout). It reports synthetic motion counters only.
+A modifier-only Ctrl+Alt chord is avoided because it can represent AltGr.
+
+Validation (Rust 1.99.1): scoped Linux GPUI library tests 484 passed/2 ignored;
+Linux platform tests 55 passed; Windows raw-mouse unit test passed. Native X11
+Xvfb/Openbox at 800x600 delivered 50 raw events totaling X=5000/Y=2000 with two
+acquisitions and both shortcut/focus-loss releases. Linux script/clippy passed
+for gpui_linux and gpui_platform, all targets/features; Windows script/clippy.ps1
+passed for gpui_windows. Downstream NyaTerm Windows check, 66 remote-desktop tests
+and two fractional-motion accumulator tests passed. The macOS x64 cross-target
+Rust check passed with a check-only shader include to bypass the host-gated Metal
+build script; no native Apple build or rendering validation is claimed. Its
+existing hidden-cursor Objective-C macro emits a pre-existing syntax warning.
+Physical Windows/macOS pointer behavior and real Wayland compositors remain
+manual acceptance requirements. The native API does not capture system shortcuts.

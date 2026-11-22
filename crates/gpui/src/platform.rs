@@ -1323,6 +1323,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    /// Request unbounded relative pointer input. Unsupported backends reject
+    /// acquisition; releasing is always safe. A successful request can be pending
+    /// compositor approval. Implementations release on deactivation and destruction.
+    /// This method must not synchronously invoke input callbacks.
+    fn set_pointer_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        if enabled {
+            anyhow::bail!("relative pointer locking is not supported by this platform")
+        }
+        Ok(())
+    }
+    /// Whether the OS currently grants this window relative pointer input.
+    fn is_pointer_locked(&self) -> bool {
+        false
+    }
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);

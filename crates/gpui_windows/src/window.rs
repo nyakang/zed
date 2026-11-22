@@ -97,6 +97,7 @@ pub struct WindowsWindowState {
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
     pub mouse_position: Cell<Point<Pixels>>,
+    pub(crate) pointer_lock: RefCell<crate::pointer_lock::PointerLock>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -206,6 +207,7 @@ impl WindowsWindowState {
             direct_manipulation,
             a11y: RefCell::new(None),
             mouse_position: Cell::new(Point::default()),
+            pointer_lock: RefCell::new(crate::pointer_lock::PointerLock::default()),
         })
     }
 
@@ -706,6 +708,7 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        self.0.state.pointer_lock.borrow_mut().release();
         self.0.drag_lifetime.borrow_mut().take();
         self.0.dialog_owner.close();
         let restore_modal_owner = self.0.modal_owner.is_pending();
@@ -738,6 +741,26 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn set_pointer_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        if enabled {
+            self.state.pointer_lock.borrow_mut().acquire(self.hwnd)?;
+            self.state
+                .cursor_visible
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            unsafe { SetCursor(None) };
+        } else {
+            self.state.pointer_lock.borrow_mut().release();
+            self.state
+                .cursor_visible
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            unsafe { SetCursor(self.state.current_cursor.get()) };
+        }
+        Ok(())
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.state.pointer_lock.borrow().active()
+    }
     fn can_start_external_drag(&self) -> bool {
         true
     }

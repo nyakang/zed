@@ -1,11 +1,10 @@
 use crate::{
-    A11yCallbacks,
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs,
-    HeadlessAtlas, Pixels, Platform, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions,
-    Scene, Size, TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
-    WindowParams, WindowVisibility,
+    A11yCallbacks, AnyWindowHandle, Bounds, Decorations, DevicePixels, DispatchEventResult,
+    DisplayId, GpuSpecs, HeadlessAtlas, Pixels, Platform, PlatformAtlas, PlatformDisplay,
+    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
@@ -63,6 +62,7 @@ pub(crate) struct TestWindowState {
     external_drag_files: Vec<(PathBuf, bool)>,
     external_drag_virtual_names: Vec<std::ffi::OsString>,
     start_external_drag_result: bool,
+    pointer_locked: bool,
 }
 
 #[derive(Clone)]
@@ -113,6 +113,7 @@ impl TestWindow {
             hit_test_window_control_callback: None,
             a11y_callbacks: None,
             input_callback: None,
+            pointer_locked: false,
             active_status_change_callback: None,
             visibility: WindowVisibility::Visible,
             visibility_callback: None,
@@ -297,6 +298,16 @@ impl TestWindow {
 
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
         let mut lock = self.0.lock();
+        if !active && std::mem::take(&mut lock.pointer_locked) {
+            if let Some(mut callback) = lock.input_callback.take() {
+                drop(lock);
+                callback(PlatformInput::PointerLock(
+                    crate::PointerLockEvent::Unlocked,
+                ));
+                lock = self.0.lock();
+                lock.input_callback = Some(callback);
+            }
+        }
         let Some(mut callback) = lock.active_status_change_callback.take() else {
             return;
         };
@@ -369,6 +380,24 @@ impl TestWindow {
 }
 
 impl PlatformWindow for TestWindow {
+    fn set_pointer_lock(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        let active = state.platform.upgrade().is_some_and(|platform| {
+            platform
+                .active_window
+                .borrow()
+                .as_ref()
+                .is_some_and(|window| Rc::ptr_eq(&window.0, &self.0))
+        });
+        anyhow::ensure!(!enabled || active, "pointer lock requires keyboard focus");
+        state.pointer_locked = enabled;
+        Ok(())
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.0.lock().pointer_locked
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn a11y_init(&self, callbacks: A11yCallbacks) {
         self.0.lock().a11y_callbacks = Some(callbacks);

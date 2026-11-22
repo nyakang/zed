@@ -1,3 +1,4 @@
+use crate::pointer_lock::PointerLock;
 use crate::{
     BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -7,6 +8,7 @@ use crate::{
 use anyhow::Result;
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
+use gpui::PointerLockEvent;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
@@ -675,6 +677,7 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     hidden_cursor: *mut AnyObject,
     cursor_visible: Arc<AtomicBool>,
+    pointer_lock: Option<PointerLock>,
     frame_source: FrameSource,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -1201,6 +1204,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 hidden_cursor,
                 cursor_visible,
+                pointer_lock: None,
                 frame_source: match &metal_frames {
                     Some(metal_frames) => FrameSource::Metal(metal_frames.clone()),
                     None => FrameSource::DisplayLink(None),
@@ -1483,6 +1487,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        this.pointer_lock.take();
         // The `GPUIView` (and with it this state) can outlive the GPUI window until AppKit
         // finishes closing it. Accessibility queries arriving in the meantime fall back to
         // `NSView`'s defaults instead of serving a tree for a window GPUI no longer updates.
@@ -1529,6 +1534,25 @@ fn if_window_not_closed(closed: Arc<AtomicBool>, f: impl FnOnce()) {
 }
 
 impl PlatformWindow for MacWindow {
+    fn set_pointer_lock(&self, enabled: bool) -> Result<()> {
+        let mut state = self.0.lock();
+        if !enabled {
+            state.pointer_lock.take();
+        } else if state.pointer_lock.is_none() {
+            anyhow::ensure!(
+                state.native_window().isKeyWindow(),
+                "pointer lock requires keyboard focus"
+            );
+            state.pointer_lock = Some(PointerLock::acquire()?);
+            state.synthetic_drag_counter += 1;
+        }
+        Ok(())
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.0.lock().pointer_lock.is_some()
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.as_ref().lock().bounds()
     }
@@ -3127,6 +3151,17 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        if lock.pointer_lock.is_some() && matches!(event, PlatformInput::MouseMove(_)) {
+            // NSEvent deltas remain unbounded when the Quartz cursor is detached.
+            // Unlike locationInWindow, deltaY already increases downwards.
+            let delta_x: f64 = unsafe { msg_send![native_event, deltaX] };
+            let delta_y: f64 = unsafe { msg_send![native_event, deltaY] };
+            let delta = point(delta_x as f32, delta_y as f32);
+            if !delta.x.is_finite() || !delta.y.is_finite() {
+                return;
+            }
+            event = PlatformInput::PointerLock(PointerLockEvent::Motion { delta });
+        }
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
@@ -3463,8 +3498,9 @@ fn report_display_change(window_state: &Rc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *mut AnyObject) {
     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = lock.native_window().isKeyWindow();
+    let pointer_unlocked = !is_active && lock.pointer_lock.take().is_some();
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
@@ -3536,6 +3572,14 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
     executor
         .spawn(async move {
             let mut lock = window_state.as_ref().lock();
+            if pointer_unlocked && lock.pointer_lock.is_none() {
+                if let Some(mut callback) = lock.event_callback.take() {
+                    drop(lock);
+                    callback(PlatformInput::PointerLock(PointerLockEvent::Unlocked));
+                    lock = window_state.lock();
+                    lock.event_callback = Some(callback);
+                }
+            }
             if is_active {
                 lock.move_traffic_light();
             }
