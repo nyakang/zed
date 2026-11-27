@@ -6,9 +6,9 @@ use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
-    px,
+    TextInputStateChange, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
+    popup::PopupNotSupportedError, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -275,6 +275,7 @@ pub struct X11WindowState {
     renderer: Option<WgpuRenderer>,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
+    ime_focus: Option<gpui::FocusId>,
     appearance: WindowAppearance,
     background_appearance: WindowBackgroundAppearance,
     maximized_vertical: bool,
@@ -845,6 +846,7 @@ impl X11WindowState {
                 renderer: Some(renderer),
                 atoms: *atoms,
                 input_handler: None,
+                ime_focus: None,
                 active: false,
                 // The window is not mapped until the client sees `MapNotify`.
                 visibility: WindowVisibility::Hidden,
@@ -1256,7 +1258,9 @@ impl X11WindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            input_handler.replace_text_in_range(None, &text);
+            if input_handler.query_accepts_focused_text_input() {
+                input_handler.replace_text_in_range(None, &text);
+            }
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         }
@@ -1269,7 +1273,9 @@ impl X11WindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            input_handler.replace_and_mark_text_in_range(None, &text, None);
+            if input_handler.query_accepts_focused_text_input() {
+                input_handler.replace_and_mark_text_in_range(None, &text, None);
+            }
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         }
@@ -1309,8 +1315,8 @@ impl X11WindowStatePtr {
         let mut bounds: Option<Bounds<Pixels>> = None;
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            if let Some(selection) = input_handler.selected_text_range(true) {
-                bounds = input_handler.bounds_for_range(selection.range);
+            if input_handler.query_accepts_focused_text_input() {
+                bounds = input_handler.ime_candidate_bounds();
             }
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
@@ -1629,7 +1635,29 @@ impl PlatformWindow for X11Window {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        self.0.state.borrow_mut().input_handler = Some(input_handler);
+        let mut state = self.0.state.borrow_mut();
+        let changed = state.ime_focus != input_handler.focus_id();
+        state.ime_focus = input_handler.focus_id();
+        state.input_handler = Some(input_handler);
+        let client = state.client.clone();
+        drop(state);
+        if changed {
+            client.input_target_changed(self.0.x_window);
+        }
+        client.request_ime_position(self.0.x_window);
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        let client = self.0.state.borrow().client.clone();
+        if matches!(
+            change,
+            TextInputStateChange::FocusGained | TextInputStateChange::FocusLost
+        ) {
+            if let Some(client) = client.get_client() {
+                client.reset_ime();
+            }
+        }
+        client.request_ime_position(self.0.x_window);
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -2102,8 +2130,9 @@ impl PlatformWindow for X11Window {
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.0.state.borrow();
         let client = state.client.clone();
+        let scale = state.scale_factor;
         drop(state);
-        client.update_ime_position(bounds);
+        client.update_ime_position(self.0.x_window, bounds.scale(scale));
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

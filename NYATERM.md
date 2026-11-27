@@ -1024,3 +1024,36 @@ build script; no native Apple build or rendering validation is claimed. Its
 existing hidden-cursor Objective-C macro emits a pre-existing syntax warning.
 Physical Windows/macOS pointer behavior and real Wayland compositors remain
 manual acceptance requirements. The native API does not capture system shortcuts.
+
+## 2026-11-28 X11 XIM lifecycle and caret recovery
+
+Replace one-shot XIM initialization and per-FocusIn context creation with a
+recoverable connection and per-window contexts. Create contexts only after the
+handshake, serialize management requests, balance focus notifications, destroy
+retired contexts, and reject stale/unfocused callbacks. Handshakes and pending
+requests time out after five seconds. Retry at 500ms/1s/2s/5s while an input is
+focused; stop maintenance when idle and remove its timer on connection teardown.
+Never replay a key whose send may already have reached the server.
+
+Select an advertised preedit style with passive status. Prefer callbacks, then
+server-rendered position/root styles: default fcitx5 does not advertise callbacks
+unless UseOnTheSpot is enabled. Reply to PreeditStart and apply Unicode preedit
+updates by character. Use the input handler's stable focus ID to reset composition
+when fields change, without changing other platform backends.
+
+Cache/coalesce per-window spot coordinates and resend after context creation or
+focus recovery. Position updates only change SpotLocation, preserve signed
+coordinates, and use the owning window's scale. Rendering adapters schedule XIM
+work on the event loop; callbacks run outside state borrows. The xim-rs dependency
+moves to nyakang/xim-rs `nyaterm` at d422786a20d3da13e610ca8faec6b518dc008f5f,
+which releases its private communication window on failure/drop and exposes the
+transport contract for deterministic tests. NyaTerm issues: #1017, #1073, #1156.
+
+Validation: Linux scoped source-copy workspace, GPUI Linux library tests and
+`script/clippy` for gpui_linux/gpui_platform, all targets/features, pass. The native
+probe passed under isolated D-Bus/Xvfb/Openbox with fcitx5 5.1.19 (default and
+UseOnTheSpot) and IBus 1.5.34-rc2/Rime 1.6.0. Each mode passed 100 focus switches,
+server restart without app restart, and 60 seconds of continuous Chinese input;
+late server startup passed for default fcitx5 and IBus. Both fcitx modes verified
+candidate positions at two caret locations. This is X11 software-display evidence,
+not native KDE/GNOME or physical Windows/macOS/Wayland acceptance.

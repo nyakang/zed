@@ -1,4 +1,7 @@
 mod pointer_lock;
+mod xim;
+
+use self::xim::XimRuntime;
 
 use anyhow::{Context as _, anyhow};
 use ashpd::WindowIdentifier;
@@ -38,13 +41,13 @@ use x11rb::{
     wrapper::ConnectionExt as _,
     xcb_ffi::XCBConnection,
 };
-use xim::{AttributeName, Client, InputStyle, x11rb::X11rbClient};
+
 use xkbc::x11::ffi::{XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION};
 use xkbcommon::xkb::{self as xkbc, STATE_LAYOUT_EFFECTIVE};
 
 use super::{
     ButtonOrScroll, ScrollDirection, X11Display, X11WindowStatePtr, XcbAtoms, XimCallbackEvent,
-    XimHandler, button_or_scroll_from_event_detail, check_reply,
+    button_or_scroll_from_event_detail, check_reply,
     clipboard::{self, Clipboard},
     get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
     pressed_button_from_mask, xcb_flush,
@@ -127,7 +130,7 @@ enum RefreshState {
 #[non_exhaustive]
 pub enum EventHandlerError {
     XCBConnectionError(ConnectionError),
-    XIMClientError(xim::ClientError),
+    XIMClientError(::xim::ClientError),
 }
 
 impl std::error::Error for EventHandlerError {}
@@ -147,8 +150,8 @@ impl From<ConnectionError> for EventHandlerError {
     }
 }
 
-impl From<xim::ClientError> for EventHandlerError {
-    fn from(err: xim::ClientError) -> Self {
+impl From<::xim::ClientError> for EventHandlerError {
+    fn from(err: ::xim::ClientError) -> Self {
         EventHandlerError::XIMClientError(err)
     }
 }
@@ -214,8 +217,7 @@ pub struct X11ClientState {
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
     keyboard_layout: LinuxKeyboardLayout,
-    pub(crate) ximc: Option<X11rbClient<Rc<XCBConnection>>>,
-    pub(crate) xim_handler: Option<XimHandler>,
+    xim: XimRuntime,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
     // TODO: Can the other updates to `modifiers` be removed so that this is unnecessary?
@@ -275,50 +277,49 @@ impl X11ClientStatePtr {
             state.cursor_hidden_window = None;
         }
         state.cursor_styles.remove(&x_window);
+        state.xim.remove_window(x_window);
+        drop(state);
+        client.schedule_xim();
     }
 
-    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+    pub fn update_ime_position(&self, window: xproto::Window, bounds: Bounds<gpui::ScaledPixels>) {
         let Some(client) = self.get_client() else {
             return;
         };
         let mut state = client.0.borrow_mut();
-        if state.composing || state.ximc.is_none() {
+        if !state.windows.contains_key(&window) {
             return;
         }
+        state.xim.set_spot(window, bounds);
+        drop(state);
+        client.schedule_xim();
+    }
 
-        let Some(mut ximc) = state.ximc.take() else {
-            log::error!("bug: xim connection not set");
+    pub fn input_target_changed(&self, window: xproto::Window) {
+        let Some(client) = self.get_client() else {
             return;
         };
-        let Some(xim_handler) = state.xim_handler.take() else {
-            log::error!("bug: xim handler not set");
-            state.ximc = Some(ximc);
+        let mut state = client.0.borrow_mut();
+        if state.keyboard_focused_window != Some(window) {
+            return;
+        }
+        state.xim.reset();
+        state.xim.request_position();
+        drop(state);
+        client.schedule_xim();
+    }
+
+    pub fn request_ime_position(&self, window: xproto::Window) {
+        let Some(client) = self.get_client() else {
             return;
         };
-        let scaled_bounds = bounds.scale(state.scale_factor);
-        let ic_attributes = ximc
-            .build_ic_attributes()
-            .push(
-                xim::AttributeName::InputStyle,
-                xim::InputStyle::PREEDIT_CALLBACKS,
-            )
-            .push(xim::AttributeName::ClientWindow, xim_handler.window)
-            .push(xim::AttributeName::FocusWindow, xim_handler.window)
-            .nested_list(xim::AttributeName::PreeditAttributes, |b| {
-                b.push(
-                    xim::AttributeName::SpotLocation,
-                    xim::Point {
-                        x: u32::from(scaled_bounds.origin.x + scaled_bounds.size.width) as i16,
-                        y: u32::from(scaled_bounds.origin.y + scaled_bounds.size.height) as i16,
-                    },
-                );
-            })
-            .build();
-        let _ = ximc
-            .set_ic_values(xim_handler.im_id, xim_handler.ic_id, ic_attributes)
-            .log_err();
-        state.ximc = Some(ximc);
-        state.xim_handler = Some(xim_handler);
+        let mut state = client.0.borrow_mut();
+        if state.keyboard_focused_window != Some(window) {
+            return;
+        }
+        state.xim.request_position();
+        drop(state);
+        client.schedule_xim();
     }
 }
 
@@ -339,6 +340,7 @@ impl std::ops::Deref for X11Connection {
 impl Drop for X11Connection {
     fn drop(&mut self) {
         let mut state = self.0.0.borrow_mut();
+        state.stop_xim_timer();
         state.common.borrow_mut().after_runnable = None;
         for token in std::mem::take(&mut state.registrations) {
             state.loop_handle.remove(token);
@@ -493,13 +495,6 @@ impl X11Connection {
 
         let xcb_connection = Rc::new(xcb_connection);
 
-        let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
-        let xim_handler = if ximc.is_some() {
-            Some(XimHandler::new())
-        } else {
-            None
-        };
-
         let background_executor = common.borrow().background_executor.clone();
         let connection = X11Connection(X11Client(Rc::new_cyclic(|this| {
             RefCell::new(X11ClientState {
@@ -536,8 +531,7 @@ impl X11Connection {
                 keyboard_focused_window: None,
                 xkb: xkb_state,
                 keyboard_layout,
-                ximc,
-                xim_handler,
+                xim: XimRuntime::new(Instant::now()),
 
                 compose_state,
                 pre_edit_text: None,
@@ -752,54 +746,27 @@ impl X11Client {
                 break;
             }
 
-            for event in events.into_iter() {
-                let mut state = self.0.borrow_mut();
-                if !state.has_xim() {
-                    drop(state);
-                    self.handle_event(event);
-                    continue;
-                }
-
-                let Some((mut ximc, mut xim_handler)) = state.take_xim() else {
-                    continue;
+            for event in events {
+                let (filtered, callbacks) = {
+                    let mut state = self.0.borrow_mut();
+                    let filtered = state.xim.filter_event(&event, Instant::now());
+                    let callbacks = std::mem::take(&mut state.xim.handler.callbacks);
+                    (filtered, callbacks)
                 };
-                let xim_connected = xim_handler.connected;
-                drop(state);
-
-                let xim_filtered = ximc.filter_event(&event, &mut xim_handler);
-                let xim_callback_event = xim_handler.last_callback_event.take();
-
-                let mut state = self.0.borrow_mut();
-                state.restore_xim(ximc, xim_handler);
-                drop(state);
-
-                if let Some(event) = xim_callback_event {
-                    self.handle_xim_callback_event(event);
+                for callback in callbacks {
+                    self.handle_xim_callback_event(callback);
                 }
-
-                match xim_filtered {
-                    Ok(handled) => {
-                        if handled {
-                            continue;
-                        }
-                        if xim_connected {
-                            self.xim_handle_event(event);
-                        } else {
-                            self.handle_event(event);
-                        }
+                match filtered {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.xim_handle_event(event);
                     }
-                    Err(err) => {
-                        // this might happen when xim server crashes on one of the events
-                        // we do lose 1-2 keys when crash happens since there is no reliable way to get that info
-                        // luckily, x11 sends us window not found error when xim server crashes upon further key press
-                        // hence we fall back to handle_event
-                        log::error!("XIMClientError: {}", err);
-                        let mut state = self.0.borrow_mut();
-                        state.take_xim();
-                        drop(state);
+                    Err(()) => {
+                        self.clear_xim_composition();
                         self.handle_event(event);
                     }
                 }
+                self.service_xim();
             }
 
             for x_window in windows_to_refresh {
@@ -824,59 +791,19 @@ impl X11Client {
 
     pub fn enable_ime(&self) {
         let mut state = self.0.borrow_mut();
-        if !state.has_xim() {
-            return;
-        }
-
-        let Some((mut ximc, xim_handler)) = state.take_xim() else {
-            return;
-        };
-        let mut ic_attributes = ximc
-            .build_ic_attributes()
-            .push(AttributeName::InputStyle, InputStyle::PREEDIT_CALLBACKS)
-            .push(AttributeName::ClientWindow, xim_handler.window)
-            .push(AttributeName::FocusWindow, xim_handler.window);
-
-        let window_id = state.keyboard_focused_window;
+        let focused = state.keyboard_focused_window;
+        state.xim.focus(focused);
+        state.xim.request_position();
         drop(state);
-        if let Some(window_id) = window_id {
-            let Some(window) = self.get_window(window_id) else {
-                log::error!("Failed to get window for IME positioning");
-                let mut state = self.0.borrow_mut();
-                state.ximc = Some(ximc);
-                state.xim_handler = Some(xim_handler);
-                return;
-            };
-            if let Some(scaled_area) = window.get_ime_area() {
-                ic_attributes =
-                    ic_attributes.nested_list(xim::AttributeName::PreeditAttributes, |b| {
-                        b.push(
-                            xim::AttributeName::SpotLocation,
-                            xim::Point {
-                                x: u32::from(scaled_area.origin.x + scaled_area.size.width) as i16,
-                                y: u32::from(scaled_area.origin.y + scaled_area.size.height) as i16,
-                            },
-                        );
-                    });
-            }
-        }
-        ximc.create_ic(xim_handler.im_id, ic_attributes.build())
-            .ok();
-        let mut state = self.0.borrow_mut();
-        state.restore_xim(ximc, xim_handler);
+        self.schedule_xim();
     }
 
     pub fn reset_ime(&self) {
         let mut state = self.0.borrow_mut();
         state.composing = false;
-        if let Some(mut ximc) = state.ximc.take() {
-            if let Some(xim_handler) = state.xim_handler.as_ref() {
-                ximc.reset_ic(xim_handler.im_id, xim_handler.ic_id).ok();
-            } else {
-                log::error!("bug: xim handler not set in reset_ime");
-            }
-            state.ximc = Some(ximc);
-        }
+        state.xim.reset();
+        drop(state);
+        self.schedule_xim();
     }
 
     pub(crate) fn get_window(&self, win: xproto::Window) -> Option<X11WindowStatePtr> {
@@ -1070,9 +997,6 @@ impl X11Client {
                 window.set_active(true);
                 let mut state = self.0.borrow_mut();
                 state.keyboard_focused_window = Some(event.event);
-                if let Some(handler) = state.xim_handler.as_mut() {
-                    handler.window = event.event;
-                }
                 drop(state);
                 self.enable_ime();
             }
@@ -1088,6 +1012,7 @@ impl X11Client {
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
                 reset_all_pointer_device_scroll_positions(&mut state.pointer_device_states);
                 state.keyboard_focused_window = None;
+                state.xim.focus(None);
                 if let Some(compose_state) = state.compose_state.as_mut() {
                     compose_state.reset();
                 }
@@ -1254,7 +1179,7 @@ impl X11Client {
                 );
                 let position = state.pointer_lock_position(event.event).unwrap_or(position);
 
-                if state.composing && state.ximc.is_some() {
+                if state.composing && state.xim.client.is_some() {
                     drop(state);
                     self.reset_ime();
                     window.handle_ime_unmark();
@@ -1563,34 +1488,26 @@ impl X11Client {
     }
 
     fn xim_handle_event(&self, event: Event) -> Option<()> {
-        match event {
-            Event::KeyPress(event) | Event::KeyRelease(event) => {
-                let mut state = self.0.borrow_mut();
-                state.pre_key_char_down = Some(keystroke_from_xkb(
-                    &state.xkb,
-                    state.modifiers,
-                    event.detail.into(),
-                ));
-                let (mut ximc, mut xim_handler) = state.take_xim()?;
-                drop(state);
-                xim_handler.window = event.event;
-                ximc.forward_event(
-                    xim_handler.im_id,
-                    xim_handler.ic_id,
-                    xim::ForwardEventFlag::empty(),
-                    &event,
-                )
-                .context("X11: Failed to forward XIM event")
-                .log_err();
-                let mut state = self.0.borrow_mut();
-                state.restore_xim(ximc, xim_handler);
-                drop(state);
-            }
-            event => {
-                self.handle_event(event);
+        if let Event::KeyPress(key) | Event::KeyRelease(key) = &event {
+            let mut state = self.0.borrow_mut();
+            state.pre_key_char_down = Some(keystroke_from_xkb(
+                &state.xkb,
+                state.modifiers,
+                key.detail.into(),
+            ));
+            let result = state.xim.forward(key, Instant::now());
+            drop(state);
+            match result {
+                Ok(true) => return Some(()),
+                // A failed send may have reached the server. Never replay it.
+                Err(()) => {
+                    self.clear_xim_composition();
+                    return Some(());
+                }
+                Ok(false) => {}
             }
         }
-        Some(())
+        self.handle_event(event)
     }
 
     fn xim_handle_commit(&self, window: xproto::Window, text: String) -> Option<()> {
@@ -1606,42 +1523,11 @@ impl X11Client {
     }
 
     fn xim_handle_preedit(&self, window: xproto::Window, text: String) -> Option<()> {
-        let Some(window) = self.get_window(window) else {
-            log::error!("bug: Failed to get window for XIM preedit");
-            return None;
-        };
-
-        let mut state = self.0.borrow_mut();
-        let (mut ximc, xim_handler) = state.take_xim()?;
-        state.composing = !text.is_empty();
-        drop(state);
-        window.handle_ime_preedit(text);
-
-        if let Some(scaled_area) = window.get_ime_area() {
-            let ic_attributes = ximc
-                .build_ic_attributes()
-                .push(
-                    xim::AttributeName::InputStyle,
-                    xim::InputStyle::PREEDIT_CALLBACKS,
-                )
-                .push(xim::AttributeName::ClientWindow, xim_handler.window)
-                .push(xim::AttributeName::FocusWindow, xim_handler.window)
-                .nested_list(xim::AttributeName::PreeditAttributes, |b| {
-                    b.push(
-                        xim::AttributeName::SpotLocation,
-                        xim::Point {
-                            x: u32::from(scaled_area.origin.x + scaled_area.size.width) as i16,
-                            y: u32::from(scaled_area.origin.y + scaled_area.size.height) as i16,
-                        },
-                    );
-                })
-                .build();
-            ximc.set_ic_values(xim_handler.im_id, xim_handler.ic_id, ic_attributes)
-                .ok();
-        }
-        let mut state = self.0.borrow_mut();
-        state.restore_xim(ximc, xim_handler);
-        drop(state);
+        let window_ref = self.get_window(window)?;
+        self.0.borrow_mut().composing = !text.is_empty();
+        window_ref.handle_ime_preedit(text);
+        self.0.borrow_mut().xim.request_position();
+        self.schedule_xim();
         Some(())
     }
 
@@ -1981,30 +1867,6 @@ impl X11Client {
 }
 
 impl X11ClientState {
-    fn has_xim(&self) -> bool {
-        self.ximc.is_some() && self.xim_handler.is_some()
-    }
-
-    fn take_xim(&mut self) -> Option<(X11rbClient<Rc<XCBConnection>>, XimHandler)> {
-        let ximc = self
-            .ximc
-            .take()
-            .ok_or(anyhow!("bug: XIM connection not set"))
-            .log_err()?;
-        if let Some(xim_handler) = self.xim_handler.take() {
-            Some((ximc, xim_handler))
-        } else {
-            self.ximc = Some(ximc);
-            log::error!("bug: XIM handler not set");
-            None
-        }
-    }
-
-    fn restore_xim(&mut self, ximc: X11rbClient<Rc<XCBConnection>>, xim_handler: XimHandler) {
-        self.ximc = Some(ximc);
-        self.xim_handler = Some(xim_handler);
-    }
-
     fn update_refresh_loop(&mut self, x_window: xproto::Window) {
         let Some(window_ref) = self.windows.get_mut(&x_window) else {
             return;
