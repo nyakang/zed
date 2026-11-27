@@ -45,6 +45,9 @@ jobs:
       - name: Check the WGPU and Linux backends
         run: cargo check -p gpui_wgpu -p gpui_linux
 
+      - name: XIM connection and input context regressions
+        run: cargo test -p gpui_linux --lib xim
+
       - name: Owned upload lifetime and batch validation
         run: |
           cargo test -p gpui_wgpu --lib owned_upload_tests

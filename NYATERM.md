@@ -1057,3 +1057,13 @@ server restart without app restart, and 60 seconds of continuous Chinese input;
 late server startup passed for default fcitx5 and IBus. Both fcitx modes verified
 candidate positions at two caret locations. This is X11 software-display evidence,
 not native KDE/GNOME or physical Windows/macOS/Wayland acceptance.
+
+The `gpui_platform` example `xim_input` and `script/test-xim.py` provide the native
+fixture. Build with `cargo build -p gpui_platform --example xim_input --features x11`;
+run the script with `--probe <binary> --engine fcitx|ibus --output <directory>`.
+`--late-start` checks discovery/retry, and `--on-the-spot` exercises fcitx callback
+preedit. Install the Rime luna_pinyin schema data as well as ibus-rime. The script
+owns a private display and D-Bus, redirects XDG directories, and reports only
+synthetic-input counters/protocol metadata. CI also runs the deterministic XIM
+state tests. Actual NyaTerm terminal/search-field integration is validated in the
+consuming application's change.

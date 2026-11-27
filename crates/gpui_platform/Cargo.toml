@@ -57,6 +57,7 @@ anyhow.workspace = true
 gpui.workspace = true
 
 [dev-dependencies]
+log.workspace = true
 bench_metrics.workspace = true
 criterion.workspace = true
 
